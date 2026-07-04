@@ -1,0 +1,11 @@
+# fix latency first (do this every session)
+echo 1 | sudo tee /sys/bus/usb-serial/devices/ttyUSB0/latency_timer
+
+# see how many combinations will run without touching the bike
+sudo venv/bin/python -m honda_reader.main --port /dev/ttyUSB0 bruteforce --dry-run
+
+# run the full sweep (ignition on, engine off)
+sudo venv/bin/python -m honda_reader.main --port /dev/ttyUSB0 --debug bruteforce
+
+# re-analyze results later without touching the bike
+python -m honda_reader.main analyze --output bruteforce_results.jsonl --top 30
