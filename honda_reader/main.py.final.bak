@@ -1,0 +1,480 @@
+import argparse
+import logging
+import random
+import sys
+import time
+from pathlib import Path
+
+import yaml
+
+from .ecu_interface import (
+    InitMode,
+    open_connection,
+    perform_handshake,
+    sweep_init_modes,
+    query_table,
+    probe_tables,
+)
+from .parser import parse_parameters
+
+logger = logging.getLogger("honda_reader")
+
+
+def load_config(path: str = "config.yaml") -> dict:
+    with open(path) as f:
+        return yaml.safe_load(f)
+
+
+def _normalize_table_key(key: str | int) -> int:
+    if isinstance(key, str):
+        return int(key, 0)
+    return key
+
+
+def _configure_logging(debug: bool) -> None:
+    logging.basicConfig(
+        level=logging.DEBUG if debug else logging.INFO,
+        format="%(asctime)s.%(msecs)03d [%(name)s] %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+
+def run_demo(config: dict) -> None:
+    tables = config.get("tables", {})
+    active_key = _normalize_table_key(config.get("active_table", 0x11))
+    table_cfg = tables.get(active_key, {})
+
+    print(f"Demo Mode — Simulating table 0x{active_key:02X}: {table_cfg.get('name', '')}")
+    print("-" * 40)
+
+    try:
+        while True:
+            data = bytes(
+                random.randint(0x00, 0xFF) for _ in range(table_cfg.get("expected_length", 24))
+            )
+            results = parse_parameters(data, table_cfg)
+            for name, info in results.items():
+                print(f"  {name}: {info['value']:.2f} {info['unit']}")
+            print("-" * 40)
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\nDemo stopped.")
+
+
+def _print_handshake_result(result: dict) -> None:
+    mode = result.get("mode", "?")
+    if result.get("success"):
+        print(f"[{mode}] Handshake OK.")
+    else:
+        print(f"[{mode}] Handshake FAILED — reason: {result.get('reason')}")
+    if "sent" in result:
+        print(f"    sent:     {_fmt(result.get('sent'))}")
+        print(f"    received: {_fmt(result.get('received'))}")
+    if "key_bytes" in result:
+        print(f"    sync_byte: {_fmt_byte(result.get('sync_byte'))}")
+        print(f"    key_bytes: {_fmt(result.get('key_bytes'))}")
+        print(f"    echo_response: {_fmt_byte(result.get('echo_response'))}")
+    if "captured" in result:
+        print(f"    captured ({len(result.get('captured') or [])} bytes): {_fmt(result.get('captured'))}")
+
+
+def _fmt(data) -> str:
+    if not data:
+        return "(none)"
+    return " ".join(f"{b:02X}" for b in data)
+
+
+def _fmt_byte(b) -> str:
+    return f"0x{b:02X}" if b is not None else "(none)"
+
+
+def run_live(config: dict, port_override: str | None, table_override: str | None, init_mode: str) -> None:
+    conn = config.get("connection", {})
+    port = port_override or conn.get("port", "COM3")
+    baud = conn.get("baudrate", 10400)
+    timeout = conn.get("timeout", 1.0)
+
+    tables = config.get("tables", {})
+    active_cfg = table_override or config.get("active_table", 0x11)
+    table_key = _normalize_table_key(active_cfg)
+    table_cfg = tables.get(table_key, {})
+
+    if not table_cfg:
+        print(f"Error: table 0x{table_key:02X} not found in config", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Connecting to {port} at {baud} baud...")
+    ser = open_connection(port, baud, timeout)
+
+    print(f"Performing handshake (mode={init_mode})...")
+    result = perform_handshake(ser, mode=InitMode(init_mode))
+    _print_handshake_result(result)
+    if not result.get("success"):
+        ser.close()
+        sys.exit(1)
+
+    print(f"Streaming table 0x{table_key:02X}: {table_cfg.get('name', '')}")
+    print("-" * 40)
+
+    try:
+        while True:
+            resp = query_table(ser, table_key)
+            if resp is None:
+                print("No response / checksum error")
+            else:
+                results = parse_parameters(bytes(resp), table_cfg)
+                for name, info in results.items():
+                    print(f"  {name}: {info['value']:.2f} {info['unit']}")
+            print("-" * 40)
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        print("\nLive stream stopped.")
+    finally:
+        ser.close()
+
+
+def run_probe(config: dict, port_override: str | None, init_mode: str, output_file: str = "probe_results.txt") -> None:
+    conn = config.get("connection", {})
+    port = port_override or conn.get("port", "COM3")
+    baud = conn.get("baudrate", 10400)
+    timeout = conn.get("timeout", 1.0)
+
+    print(f"Connecting to {port} at {baud} baud...")
+    ser = open_connection(port, baud, timeout)
+
+    print(f"Performing handshake (mode={init_mode})...")
+    result = perform_handshake(ser, mode=InitMode(init_mode))
+    _print_handshake_result(result)
+    if not result.get("success"):
+        ser.close()
+        sys.exit(1)
+
+    print(f"Handshake OK. Probing table IDs 0x00-0xFF...")
+    print(f"Results written incrementally to: {output_file}")
+    print("-" * 40)
+
+    active_count = 0
+
+    with open(output_file, "a") as f:
+        f.write(f"\n=== Probe session {__import__('datetime').datetime.now().isoformat()} ===\n")
+        f.flush()
+
+        for table_id in range(0x00, 0x100):
+            print(f"\r  Probing 0x{table_id:02X}...", end="", flush=True)
+            try:
+                resp = query_table(ser, table_id)
+                if resp is not None:
+                    active_count += 1
+                    hex_str = " ".join(f"{b:02X}" for b in resp)
+                    line = f"ACTIVE  0x{table_id:02X}  len={len(resp)}  bytes={hex_str}"
+                    print(f"\n  *** {line}")
+                    f.write(line + "\n")
+                    f.flush()
+                else:
+                    f.write(f"SILENT  0x{table_id:02X}\n")
+                    f.flush()
+            except Exception as exc:
+                line = f"ERROR   0x{table_id:02X}  {exc}"
+                f.write(line + "\n")
+                f.flush()
+
+        f.write(f"=== Done. Active tables: {active_count} ===\n")
+
+    print(f"\nProbe complete. Active tables: {active_count}")
+    print(f"Full results saved to: {output_file}")
+    ser.close()
+
+
+def run_service_sweep(config: dict, port_override: str | None, init_mode: str,
+                       table_id_str: str, output_file: str) -> None:
+    from .ecu_interface import service_byte_sweep
+
+    conn = config.get("connection", {})
+    port = port_override or conn.get("port", "COM3")
+    baud = conn.get("baudrate", 10400)
+    timeout = conn.get("timeout", 1.0)
+
+    table_id = int(table_id_str, 0)
+
+    print(f"Connecting to {port} at {baud} baud...")
+    ser = open_connection(port, baud, timeout)
+
+    print(f"Performing handshake (mode={init_mode})...")
+    result = perform_handshake(ser, mode=InitMode(init_mode))
+    _print_handshake_result(result)
+    if not result.get("success"):
+        ser.close()
+        sys.exit(1)
+
+    print(f"Handshake OK. Sweeping service byte 0x00-0xFF with table_id=0x{table_id:02X}...")
+    print(f"Results written incrementally to: {output_file}")
+    print("-" * 40)
+
+    service_byte_sweep(ser, output_file, table_id=table_id)
+    ser.close()
+
+
+def run_init_sweep(config: dict, port_override: str | None) -> None:
+    """Tries every known init mode in turn and reports which one (if any) gets a response."""
+    conn = config.get("connection", {})
+    port = port_override or conn.get("port", "COM3")
+    baud = conn.get("baudrate", 10400)
+    timeout = conn.get("timeout", 1.0)
+
+    print(f"Sweeping all init modes against {port} at {baud} baud...")
+    print("-" * 40)
+    results = sweep_init_modes(port, baud, timeout)
+    for mode_name, result in results.items():
+        _print_handshake_result(result)
+        print("-" * 40)
+
+
+def run_sniff(config: dict, port_override: str | None, duration: float) -> None:
+    """Passive listen mode — no init sequence sent at all."""
+    conn = config.get("connection", {})
+    port = port_override or conn.get("port", "COM3")
+    baud = conn.get("baudrate", 10400)
+    timeout = conn.get("timeout", 1.0)
+
+    print(f"Passively sniffing {port} at {baud} baud for {duration}s (no init sent)...")
+    ser = open_connection(port, baud, timeout)
+    result = perform_handshake(ser, mode=InitMode.PASSIVE_SNIFF, duration_s=duration)
+    ser.close()
+    _print_handshake_result(result)
+
+
+def run_verify(config: dict, port_override: str | None, init_mode: str,
+               sweep_file: str, table_id_str: str, repeats: int) -> None:
+    from .ecu_interface import parse_candidates_from_sweep_file, verify_candidates
+
+    conn = config.get("connection", {})
+    port = port_override or conn.get("port", "COM3")
+    baud = conn.get("baudrate", 10400)
+    timeout = conn.get("timeout", 1.0)
+    table_id = int(table_id_str, 0)
+
+    candidates = parse_candidates_from_sweep_file(sweep_file)
+    if not candidates:
+        print(f"No '***' flagged candidates found in {sweep_file}")
+        sys.exit(1)
+
+    print(f"Found {len(candidates)} candidates in {sweep_file}: "
+          f"{[f'0x{c:02X}' for c in candidates]}")
+
+    print(f"Connecting to {port} at {baud} baud...")
+    ser = open_connection(port, baud, timeout)
+
+    print(f"Performing handshake (mode={init_mode})...")
+    result = perform_handshake(ser, mode=InitMode(init_mode))
+    _print_handshake_result(result)
+    if not result.get("success"):
+        ser.close()
+        sys.exit(1)
+
+    verify_candidates(ser, candidates, table_id=table_id, repeats=repeats)
+    ser.close()
+
+
+def run_bruteforce_cmd(args) -> None:
+    from .bruteforce import load_results, print_summary, run_bruteforce
+
+    output = Path(args.bf_output)
+    results = run_bruteforce(
+        port=args.port or "COM3",
+        output_path=output,
+        baud_list=[int(x) for x in args.bf_baud.split(",")] if args.bf_baud else None,
+        break_low_list=[int(x) for x in args.bf_low.split(",")] if args.bf_low else None,
+        break_high_list=[int(x) for x in args.bf_high.split(",")] if args.bf_high else None,
+        post_break_list=[int(x) for x in args.bf_delay.split(",")] if args.bf_delay else None,
+        delay_between_s=args.bf_interval,
+        dry_run=args.bf_dry_run,
+    )
+    if results:
+        print_summary(results)
+    print(f"\nFull results saved to: {output}")
+
+
+def run_analyze_cmd(args) -> None:
+    from .bruteforce import load_results, print_summary
+
+    results = load_results(Path(args.bf_output))
+    print_summary(results, top_n=args.bf_top)
+
+
+def run_diff_capture(config: dict, port_override: str | None, init_mode: str,
+                      sweep_file: str, table_id_str: str, state_name: str,
+                      json_output: str, repeats: int) -> None:
+    from .ecu_interface import (
+        capture_candidate_snapshot,
+        parse_candidates_from_sweep_file,
+        save_snapshot,
+    )
+
+    conn = config.get("connection", {})
+    port = port_override or conn.get("port", "COM3")
+    baud = conn.get("baudrate", 10400)
+    timeout = conn.get("timeout", 1.0)
+    table_id = int(table_id_str, 0)
+
+    candidates = parse_candidates_from_sweep_file(sweep_file)
+    if not candidates:
+        print(f"No '***' flagged candidates found in {sweep_file}")
+        sys.exit(1)
+
+    print(f"Found {len(candidates)} candidates in {sweep_file}")
+    print(f"Capturing state: '{state_name}'")
+
+    print(f"Connecting to {port} at {baud} baud...")
+    ser = open_connection(port, baud, timeout)
+
+    print(f"Performing handshake (mode={init_mode})...")
+    result = perform_handshake(ser, mode=InitMode(init_mode))
+    _print_handshake_result(result)
+    if not result.get("success"):
+        ser.close()
+        sys.exit(1)
+
+    snapshot = capture_candidate_snapshot(ser, candidates, table_id=table_id, repeats=repeats)
+    save_snapshot(json_output, state_name, snapshot)
+    ser.close()
+
+    print(f"\nSnapshot for state '{state_name}' saved to {json_output}")
+    print("Capture another state (e.g. --state idle, --state revved) and then run 'diff-analyze'.")
+
+
+def run_diff_analyze(json_input: str) -> None:
+    from .ecu_interface import compare_snapshots
+    compare_snapshots(json_input)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Honda Keihin K-Line ECU Reader & Prober"
+    )
+
+    sub = parser.add_subparsers(dest="command")
+
+    # demo
+    sub.add_parser("demo", help="Simulated data, no hardware needed")
+
+    # live
+    p_live = sub.add_parser("live", help="Live stream from physical ECU")
+    p_live.add_argument("--table", help="Table ID override (e.g. 0x11)")
+    p_live.add_argument("--init-mode", choices=[m.value for m in InitMode if m != InitMode.PASSIVE_SNIFF],
+                        default=InitMode.FAST_KEIHIN.value)
+
+    # probe
+    p_probe = sub.add_parser("probe", help="Fuzz all table IDs after handshake")
+    p_probe.add_argument("--init-mode", choices=[m.value for m in InitMode if m != InitMode.PASSIVE_SNIFF],
+                         default=InitMode.FAST_KEIHIN.value)
+    p_probe.add_argument("--output", default="probe_results.txt",
+                         help="File to write results to incrementally")
+
+    # verify
+    p_verify = sub.add_parser("verify", help="Re-test candidates from a sweep file for consistency")
+    p_verify.add_argument("--init-mode", choices=[m.value for m in InitMode if m != InitMode.PASSIVE_SNIFF],
+                          default=InitMode.TWO_PHASE.value)
+    p_verify.add_argument("--sweep-file", default="service_sweep_results.txt")
+    p_verify.add_argument("--table-id", default="0x11")
+    p_verify.add_argument("--repeats", type=int, default=5)
+
+    # diff-capture
+    p_diffcap = sub.add_parser("diff-capture", help="Snapshot candidates at one engine state")
+    p_diffcap.add_argument("--init-mode", choices=[m.value for m in InitMode if m != InitMode.PASSIVE_SNIFF],
+                           default=InitMode.TWO_PHASE.value)
+    p_diffcap.add_argument("--sweep-file", default="service_sweep_results.txt")
+    p_diffcap.add_argument("--table-id", default="0x11")
+    p_diffcap.add_argument("--state", required=True,
+                           help="Label for this engine state, e.g. ignition_on, idle, revved")
+    p_diffcap.add_argument("--json-output", default="diff_results.json")
+    p_diffcap.add_argument("--repeats", type=int, default=3)
+
+    # diff-analyze
+    p_diffan = sub.add_parser("diff-analyze", help="Compare captured states to find real vs fixed responses")
+    p_diffan.add_argument("--json-input", default="diff_results.json")
+
+    # init-sweep
+    sub.add_parser("init-sweep", help="Try every known init mode and report")
+
+    # sniff
+    p_sniff = sub.add_parser("sniff", help="Passive listen, no init sent")
+    p_sniff.add_argument("--duration", type=float, default=10.0, help="Seconds to listen")
+
+    # service-sweep
+    p_svc = sub.add_parser("service-sweep", help="Sweep service byte 0x00-0xFF")
+    p_svc.add_argument("--init-mode", choices=[m.value for m in InitMode if m != InitMode.PASSIVE_SNIFF],
+                       default=InitMode.TWO_PHASE.value)
+    p_svc.add_argument("--table-id", default="0x11", help="Table ID to keep fixed (default 0x11)")
+    p_svc.add_argument("--output", default="service_sweep_results.txt")
+
+    # bruteforce
+    p_bf = sub.add_parser("bruteforce", help="Sweep all init parameter combinations brute-force")
+    p_bf.add_argument("--output", dest="bf_output", default="bruteforce_results.jsonl",
+                      help="JSONL file to write results to (appended incrementally)")
+    p_bf.add_argument("--baud", dest="bf_baud", default=None,
+                      help="Comma-separated baud rates to try (default: 10400,9600,19200)")
+    p_bf.add_argument("--low", dest="bf_low", default=None,
+                      help="Comma-separated break-low durations ms (default: 25,50,70,100,200,300)")
+    p_bf.add_argument("--high", dest="bf_high", default=None,
+                      help="Comma-separated break-high durations ms (default: 25,50,100,120,200)")
+    p_bf.add_argument("--delay", dest="bf_delay", default=None,
+                      help="Comma-separated post-break delays ms (default: 0,10,25,50,100)")
+    p_bf.add_argument("--interval", dest="bf_interval", type=float, default=0.3,
+                      help="Seconds between attempts (default: 0.3)")
+    p_bf.add_argument("--dry-run", dest="bf_dry_run", action="store_true",
+                      help="List all combinations without sending anything")
+
+    # analyze
+    p_an = sub.add_parser("analyze", help="Re-analyze a previous bruteforce JSONL result file")
+    p_an.add_argument("--output", dest="bf_output", default="bruteforce_results.jsonl",
+                      help="JSONL file to read")
+    p_an.add_argument("--top", dest="bf_top", type=int, default=20,
+                      help="Show top N results (default: 20)")
+
+    # ---- global flags ----
+    parser.add_argument("--port", help="Serial port (e.g. /dev/ttyUSB0)")
+    parser.add_argument("--config", default=str(Path(__file__).parent / "config.yaml"))
+    parser.add_argument("--debug", action="store_true",
+                        help="Log raw TX/RX bytes (strongly recommended during RE)")
+
+    args = parser.parse_args()
+    _configure_logging(args.debug)
+
+    if args.command in (None, "demo"):
+        config = load_config(args.config)
+        run_demo(config)
+        return
+
+    if args.command == "bruteforce":
+        run_bruteforce_cmd(args)
+        return
+
+    if args.command == "analyze":
+        run_analyze_cmd(args)
+        return
+
+    config = load_config(args.config)
+
+    if args.command == "live":
+        run_live(config, args.port, getattr(args, "table", None), args.init_mode)
+    elif args.command == "probe":
+        run_probe(config, args.port, args.init_mode, args.output)
+    elif args.command == "init-sweep":
+        run_init_sweep(config, args.port)
+    elif args.command == "sniff":
+        run_sniff(config, args.port, args.duration)
+    elif args.command == "service-sweep":
+        run_service_sweep(config, args.port, args.init_mode, args.table_id, args.output)
+    elif args.command == "verify":
+        run_verify(config, args.port, args.init_mode, args.sweep_file, args.table_id, args.repeats)
+    elif args.command == "diff-capture":
+        run_diff_capture(config, args.port, args.init_mode, args.sweep_file,
+                         args.table_id, args.state, args.json_output, args.repeats)
+    elif args.command == "diff-analyze":
+        run_diff_analyze(args.json_input)
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()

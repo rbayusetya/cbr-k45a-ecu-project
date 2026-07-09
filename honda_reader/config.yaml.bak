@@ -1,0 +1,47 @@
+connection:
+  port: "/dev/ttyUSB0"
+  baudrate: 10400
+  timeout: 1.0
+
+active_table: 0x11
+
+tables:
+  0x11:
+    name: "Live Telemetry"
+    expected_length: 24
+    parameters:
+      engine_rpm:
+        offset: 4
+        length: 2
+        endian: "big"
+        formula: "x"
+        unit: "RPM"
+      throttle_position:
+        offset: 6
+        length: 1
+        endian: "big"
+        formula: "x * 0.784"
+        unit: "%"
+      coolant_temp:
+        offset: 7
+        length: 1
+        endian: "big"
+        formula: "x - 40"
+        unit: "°C"
+      voltage:
+        offset: 12
+        length: 2
+        endian: "big"
+        formula: "x / 100"
+        unit: "V"
+
+  0x12:
+    name: "DTC Engine Codes"
+    expected_length: 12
+    parameters:
+      active_errors:
+        offset: 4
+        length: 1
+        endian: "big"
+        formula: "x"
+        unit: "count"

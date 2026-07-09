@@ -1,26 +1,36 @@
 """
-Honda Keihin K-Line ECU interface.
+Honda Keihin K-Line ECU interface — rewritten against CONFIRMED protocol.
 
-Reworked for reverse-engineering an undocumented ECU (Honda CBR150R K45A,
-Indonesian market). Since there is no factory spec to confirm the wake-up
-protocol, this module supports SEVERAL candidate init strategies and gives
-raw on-the-wire visibility (--debug logging) so you can empirically figure
-out which one the ECU actually responds to, rather than betting everything
-on a single hardcoded sequence.
+Prior versions of this module were built through brute-force reverse
+engineering with no reference. We have since obtained:
+  1. Real source from eculib/honda.py (Ryan Hope's original HondaECU project,
+     GPL-3, later commercialized by MCU Innovations) -- confirms message
+     framing, checksum algorithm, and the send/receive pattern.
+  2. A Scribd-hosted "Honda Kline Command Protocol Guide" table showing
+     exact confirmed request/response byte sequences for WAKEUP, VIN,
+     LIVE DATA (table 0x17), READ DTC, and CLEAR DTC.
 
-Supported init modes (see InitMode):
-    fast_keihin     - "Fast Init" break low 70ms / high 120ms (common in
-                       aftermarket Keihin K-line tools / clone cables)
-    fast_iso14230   - Standard ISO14230 Fast Init: low 25ms / high 25ms
-    slow_5baud      - ISO9141-2 style 5-baud slow init: bit-bang address
-                       byte 0x10 at 5 baud, then look for sync (0x55) +
-                       2 key bytes
-    passive_sniff   - No init at all. Just open the port and log whatever
-                       the ECU/bus does on its own.
-    two_phase       - Confirmed K45A sequence:
-                       P1: break 25/25ms + 0x33 -> 0x31 ack
-                       P2a: burst FE 04 72 8C -> ECU wake ack
-                       P2b: burst 72 05 00 F0 99 -> ECU ready ack
+Both sources agree byte-for-byte once decoded, and this rewrite is built
+directly from that confirmed spec rather than guesswork. Notably:
+  - Our earlier init packet used mode byte 0x0F, which was NEVER confirmed
+    and never worked -- the real init mode byte is 0x00.
+  - Our earlier default table (0x11) was invalid on this ECU family --
+    the real live-data table is 0x17.
+  - The "bit-flip collision" we spent a long time chasing was very likely
+    an artifact of our OWN per-byte send/read interleaving, not real bus
+    contention. The real protocol drains the full TX echo as one distinct
+    phase, THEN does a separate read for the actual ECU response -- there
+    is no byte-level race if done this way.
+
+One thing NOT in the reference source: our own hardware/ECU empirically
+required an extra address handshake (send 0x33, expect 0x31) before the
+break-pulse + wake + init sequence would do anything at all. This isn't
+documented anywhere we've found, so it's kept here as an optional,
+clearly-labeled prefix step (`do_address_prestep`) rather than assumed
+universal. Toggle it off to test whether it was ever really necessary now
+that the echo-draining bug is fixed -- it's possible it was compensating
+for the same collision bug elsewhere in the old code, not a real protocol
+requirement.
 """
 
 import logging
@@ -31,51 +41,115 @@ import serial
 
 logger = logging.getLogger("honda_reader.ecu")
 
-HEADER_REQUEST  = 0x72
-HEADER_RESPONSE = 0x02
-MODE_QUERY      = 0x71
-MODE_HANDSHAKE  = 0x0F
 
-HANDSHAKE_REQUEST = [0x72, 0x05, 0x0F, 0xF0]
-SLOW_INIT_ADDRESS = 0x10
+# ---------------------------------------------------------------------------
+# Confirmed protocol constants
+# ---------------------------------------------------------------------------
 
+# Known-good table IDs, confirmed from eculib/honda.py probe_tables() default list.
+KNOWN_TABLES = [0x10, 0x11, 0x17, 0x20, 0x21, 0x60, 0x61, 0x67, 0x70, 0x71, 0xD0, 0xD1]
 
-class InitMode(str, Enum):
-    FAST_KEIHIN   = "fast_keihin"
-    FAST_ISO14230 = "fast_iso14230"
-    SLOW_5BAUD    = "slow_5baud"
-    PASSIVE_SNIFF = "passive_sniff"
-    TWO_PHASE     = "two_phase"
+# Live telemetry table -- confirmed via Scribd capture AND matches the
+# AutotronicCommunity K25 reference. Our old default of 0x11 was wrong.
+LIVE_DATA_TABLE = 0x17
 
+# VIN is read the same way as any other table, at table ID 0x00.
+VIN_TABLE = 0x00
 
-FAST_INIT_TIMINGS = {
-    InitMode.FAST_KEIHIN:   {"low_ms": 70,  "high_ms": 120},
-    InitMode.FAST_ISO14230: {"low_ms": 25,  "high_ms": 25},
+# DTC code lookup, ported from eculib/honda.py
+DTC = {
+    "01-01": "MAP sensor circuit low voltage",
+    "01-02": "MAP sensor circuit high voltage",
+    "02-01": "MAP sensor performance problem",
+    "07-01": "ECT sensor circuit low voltage",
+    "07-02": "ECT sensor circuit high voltage",
+    "08-01": "TP sensor circuit low voltage",
+    "08-02": "TP sensor circuit high voltage",
+    "09-01": "IAT sensor circuit low voltage",
+    "09-02": "IAT sensor circuit high voltage",
+    "11-01": "VS sensor no signal",
+    "12-01": "No.1 primary injector circuit malfunction",
+    "13-01": "No.2 primary injector circuit malfunction",
+    "14-01": "No.3 primary injector circuit malfunction",
+    "15-01": "No.4 primary injector circuit malfunction",
+    "16-01": "No.1 secondary injector circuit malfunction",
+    "17-01": "No.2 secondary injector circuit malfunction",
+    "18-01": "CMP sensor no signal",
+    "19-01": "CKP sensor no signal",
+    "21-01": "O2 sensor malfunction",
+    "23-01": "O2 sensor heater malfunction",
+    "25-02": "Knock sensor circuit malfunction",
+    "25-03": "Knock sensor circuit malfunction",
+    "29-01": "IACV circuit malfunction",
+    "33-02": "ECM EEPROM malfunction",
+    "34-01": "ECV POT low voltage malfunction",
+    "34-02": "ECV POT high voltage malfunction",
+    "35-01": "EGCA malfunction",
+    "48-01": "No.3 secondary injector circuit malfunction",
+    "49-01": "No.4 secondary injector circuit malfunction",
+    "51-01": "HESD linear solenoid malfunction",
+    "54-01": "Bank angle sensor circuit low voltage",
+    "54-02": "Bank angle sensor circuit high voltage",
+    "56-01": "Knock sensor IC malfunction",
+    "86-01": "Serial communication malfunction",
 }
 
 
+class InitMode(str, Enum):
+    """
+    Only two modes remain after cleanup:
+      TWO_PHASE     - the real, confirmed protocol (optionally prefixed
+                       with our empirically-required address handshake)
+      PASSIVE_SNIFF - listen-only, no transmission, useful for diagnostics
+                       or capturing a real tool's session on a Y-tap
+    Older speculative modes (fast_iso14230, slow_5baud, and the old
+    fast_keihin using an unconfirmed 0x0F init byte) have been removed --
+    they were guesses made before we had any real reference, and keeping
+    them around no longer serves a purpose now that the real protocol
+    is confirmed.
+    """
+    TWO_PHASE = "two_phase"
+    PASSIVE_SNIFF = "passive_sniff"
+
+
 # ---------------------------------------------------------------------------
-# Checksum / packet helpers
+# Checksum / message framing -- ported from eculib/honda.py, verified by
+# hand against every confirmed capture we have (wake, init, VIN, live data,
+# read/clear DTC all check out byte-for-byte).
 # ---------------------------------------------------------------------------
 
-def calculate_checksum(packet: list) -> int:
-    """Standard Keihin 8-bit subtraction checksum."""
-    return (0x100 - (sum(packet) & 0xFF)) & 0xFF
+def checksum(data: list) -> int:
+    """
+    Standard Keihin two's-complement checksum.
+    Mathematically identical to eculib's checksum8bitHonda():
+        ((sum(data) ^ 0xFF) + 1) & 0xFF  ==  (0x100 - (sum(data) & 0xFF)) & 0xFF
+    """
+    return (0x100 - (sum(data) & 0xFF)) & 0xFF
 
 
-def verify_checksum(packet: list) -> bool:
-    if len(packet) < 2:
-        return False
-    data_sum  = sum(packet[:-1]) & 0xFF
-    expected  = (0x100 - data_sum) & 0xFF
-    return packet[-1] == expected
+def message_is_valid(full_message: list) -> bool:
+    """
+    A complete message (including its own trailing checksum byte) is valid
+    if the checksum of the WHOLE thing comes out to 0 -- this is the
+    standard two's-complement checksum invariant, confirmed against
+    eculib's `checksum8bitHonda(byts) == 0` validation.
+    """
+    return checksum(full_message) == 0
 
 
-def build_packet(mode: int, table_id: int, data_bytes: list | None = None) -> list:
-    data    = data_bytes or []
-    payload = [HEADER_REQUEST, 0, mode, table_id] + data
-    payload[1] = len(payload) + 1
-    return payload + [calculate_checksum(payload)]
+def format_message(mtype: list, data: list) -> list:
+    """
+    Builds a complete message: mtype + [length] + data + [checksum].
+    Ported directly from eculib.honda.format_message(). The length byte
+    equals the TOTAL message length (header + length byte + data + checksum),
+    confirmed against every captured example we have.
+    """
+    ml = len(mtype)
+    dl = len(data)
+    msgsize = 2 + ml + dl
+    msg = mtype + [msgsize] + data
+    msg = msg + [checksum(msg)]
+    return msg
 
 
 # ---------------------------------------------------------------------------
@@ -106,46 +180,105 @@ def open_connection(port: str, baudrate: int, timeout: float) -> serial.Serial:
         timeout=timeout,
     )
 
-def _reopen_baud(ser: serial.Serial, baudrate: int) -> None:
-    ser.baudrate = baudrate
-    ser.reset_input_buffer()
-    ser.reset_output_buffer()
 
-
-# ---------------------------------------------------------------------------
-# Core send+capture primitive
-# Used everywhere we need to see raw wire bytes without echo filtering.
-# Sends the packet as a single burst, then reads everything on the wire
-# for window_s seconds and returns ALL bytes (our echo + ECU response).
-# Callers strip the echo by slicing off len(packet) bytes from the front.
-# ---------------------------------------------------------------------------
-
-def _send_and_capture(ser: serial.Serial, packet: list, label: str,
-                      window_s: float = 2.0) -> list:
-    ser.reset_input_buffer()
-    ser.reset_output_buffer()
-
-    _log_tx(label, packet)
-    ser.write(bytearray(packet))
-
-    ser.timeout = 0.05
-    raw      = bytearray()
-    deadline = time.time() + window_s
-    while time.time() < deadline:
-        chunk = ser.read(64)
+def _read_exact(ser: serial.Serial, n: int, deadline: float):
+    """
+    Reads exactly n bytes, polling until the deadline. Returns bytes if
+    successful, or None if the deadline passes with fewer than n bytes
+    collected. This is the building block for correctly separating
+    "our own echo" from "the ECU's actual response" as two distinct,
+    sequential phases -- the key fix from the old collision-prone code.
+    """
+    buf = bytearray()
+    while len(buf) < n and time.time() < deadline:
+        chunk = ser.read(n - len(buf))
         if chunk:
-            raw.extend(chunk)
-    ser.timeout = 1.0
-
-    _log_rx(f"{label}_raw", list(raw))
-    return list(raw)
+            buf.extend(chunk)
+    if len(buf) < n:
+        return None
+    return bytes(buf)
 
 
 # ---------------------------------------------------------------------------
-# Init Mode 1 & 2: Fast Init (break-pulse based)
+# Core send/receive primitive
+#
+# Confirmed two-phase pattern from eculib.honda.HondaECU.send():
+#   1. Write the full message.
+#   2. Read and discard EXACTLY len(message) bytes as our own TX echo --
+#      as one distinct, complete phase, not interleaved byte-by-byte.
+#   3. THEN, as a separate read, get the response header + length byte.
+#   4. Read the remaining bytes (data + checksum) based on the length byte.
+#   5. Validate checksum and response header.
+#
+# There is no byte-level race in this pattern -- the old "bit-flip
+# collision" we spent so long chasing was very likely an artifact of our
+# own flawed per-byte interleaved send/read logic, not real ECU behavior.
 # ---------------------------------------------------------------------------
 
-def _fast_init_pulse(ser: serial.Serial, low_ms: int, high_ms: int) -> None:
+def send_and_receive(ser: serial.Serial, mtype: list, data: list,
+                      timeout: float = 2.0, label: str = "") -> list | None:
+    """
+    Sends a message built from mtype+data, and returns the ECU's response
+    data payload (list of ints), or None on timeout/invalid response.
+    """
+    msg = format_message(mtype, data)
+    ml = len(mtype)
+    label = label or f"cmd_0x{mtype[0]:02X}"
+
+    ser.reset_input_buffer()
+    ser.reset_output_buffer()
+
+    _log_tx(label, msg)
+    ser.write(bytearray(msg))
+
+    deadline = time.time() + timeout
+
+    # Phase 1: drain our own TX echo, as one complete distinct read.
+    echo = _read_exact(ser, len(msg), deadline)
+    if echo is None:
+        logger.debug("%s: no echo received (timeout)", label)
+        return None
+    _log_rx(f"{label}_echo", list(echo))
+
+    # Phase 2: read response header + length byte.
+    header = _read_exact(ser, ml + 1, deadline)
+    if header is None:
+        logger.debug("%s: no response header (timeout)", label)
+        return None
+
+    length_byte = header[ml]
+    remaining = length_byte - ml - 1
+    if remaining <= 0:
+        logger.debug("%s: implausible length byte 0x%02X", label, length_byte)
+        return None
+
+    rest = _read_exact(ser, remaining, deadline)
+    if rest is None:
+        logger.debug("%s: incomplete response body (timeout)", label)
+        return None
+
+    full_response = list(header) + list(rest)
+    _log_rx(f"{label}_response", full_response)
+
+    if not message_is_valid(full_response):
+        logger.debug("%s: checksum mismatch: %s", label, _hex(full_response))
+        return None
+
+    expected_header = [(b & 0x0F) for b in mtype]
+    if full_response[:ml] != expected_header:
+        logger.debug("%s: unexpected header %s (expected %s)",
+                     label, _hex(full_response[:ml]), _hex(expected_header))
+        return None
+
+    rdata = full_response[ml + 1:-1]
+    return rdata
+
+
+# ---------------------------------------------------------------------------
+# Break pulse (physical wake-up line toggle)
+# ---------------------------------------------------------------------------
+
+def _break_pulse(ser: serial.Serial, low_ms: float, high_ms: float) -> None:
     ser.break_condition = True
     time.sleep(low_ms / 1000.0)
     ser.break_condition = False
@@ -154,136 +287,102 @@ def _fast_init_pulse(ser: serial.Serial, low_ms: int, high_ms: int) -> None:
     ser.reset_output_buffer()
 
 
-def _read_with_echo_cancel(ser: serial.Serial, sent_packet: list,
-                            n_response_bytes: int):
-    first_byte = ser.read(1)
-    if not first_byte:
-        return None
-    first_val = first_byte[0]
-
-    if first_val == sent_packet[0]:
-        remaining_echo = len(sent_packet) - 1
-        echoed = ser.read(remaining_echo) if remaining_echo > 0 else b""
-        _log_rx("echo", bytes([first_val]) + echoed)
-        first_byte = ser.read(1)
-        if not first_byte:
-            return None
-        first_val = first_byte[0]
-
-    rest     = ser.read(max(n_response_bytes - 1, 0))
-    response = [first_val] + list(rest)
-    _log_rx("response", response)
-    return response
-
-
-def fast_init_handshake(ser: serial.Serial,
-                         mode: InitMode = InitMode.FAST_KEIHIN) -> dict:
-    timing = FAST_INIT_TIMINGS[mode]
-    logger.debug("Fast init (%s): low=%dms high=%dms",
-                 mode.value, timing["low_ms"], timing["high_ms"])
-    _fast_init_pulse(ser, timing["low_ms"], timing["high_ms"])
-
-    cs     = calculate_checksum(HANDSHAKE_REQUEST)
-    packet = HANDSHAKE_REQUEST + [cs]
-    _log_tx(mode.value, packet)
-    ser.write(bytearray(packet))
-
-    response = _read_with_echo_cancel(ser, packet, n_response_bytes=5)
-
-    result = {
-        "mode":     mode.value,
-        "sent":     packet,
-        "received": response,
-        "success":  False,
-        "reason":   None,
-    }
-
-    if response is None:
-        result["reason"] = "timeout_no_response"
-        return result
-    if response[0] != HEADER_RESPONSE:
-        result["reason"] = f"unexpected_header_0x{response[0]:02X}"
-        return result
-    if len(response) < 5:
-        result["reason"] = "short_response"
-        return result
-    if not verify_checksum(response):
-        result["reason"] = "checksum_mismatch"
-        return result
-
-    result["success"] = response[2] == 0x0F and response[3] == 0xF0
-    if not result["success"]:
-        result["reason"] = "unexpected_payload"
-    return result
-
-
 # ---------------------------------------------------------------------------
-# Init Mode 3: ISO9141-2 5-baud slow init
+# Handshake -- confirmed protocol, with optional empirical prefix.
+#
+# Confirmed sequence (from eculib.honda.HondaECU.init/ping/diag and
+# matching the Scribd WAKEUP/table rows):
+#   1. Break pulse low=70ms, high=130ms
+#   2. ping():  mtype=[0xFE], data=[0x72]        -> expect header 0x0E
+#   3. diag():  mtype=[0x72], data=[0x00, 0xF0]  -> expect header 0x02
+#
+# Empirical prefix (do_address_prestep=True, default on since it's what
+# has actually worked on this bike so far): before the above, send 0x33
+# and expect 0x31 back after a 25ms/25ms break pulse. This is NOT in any
+# reference source we've found. Now that the collision bug in the old
+# per-byte query code is understood and fixed here, it's worth testing
+# with do_address_prestep=False to see if this step was ever really
+# necessary, or was masking a different bug.
 # ---------------------------------------------------------------------------
 
-def _send_bit_banged_byte(ser: serial.Serial, byte_val: int,
-                           bit_ms: float) -> None:
-    bits  = [0]
-    bits += [(byte_val >> i) & 1 for i in range(8)]
-    bits += [1]
-    for bit in bits:
-        ser.break_condition = (bit == 0)
-        time.sleep(bit_ms / 1000.0)
-    ser.break_condition = False
-
-
-def slow_init_handshake(ser: serial.Serial,
-                         address: int   = SLOW_INIT_ADDRESS,
-                         target_baud: int = 10400,
-                         key_wait_s: float = 2.0) -> dict:
-    logger.debug("Slow init: address=0x%02X bit_time=200ms", address)
-    _send_bit_banged_byte(ser, address, bit_ms=200.0)
-    _reopen_baud(ser, target_baud)
-
+def two_phase_handshake(ser: serial.Serial, do_address_prestep: bool = True,
+                         skip_wake: bool = False) -> dict:
+    """
+    skip_wake: the K45A has been observed to NOT respond to the FE 04 72 8C
+    wake packet at all (clean echo, then silence -- confirmed twice, once
+    under the old buggy collision-prone code and again under this fixed
+    version). Not all Keihin ECUs in this model range implement every
+    protocol step identically. When skip_wake=True, we go straight from
+    the address pre-step to diag(), which is the only thing that has ever
+    gotten a response out of this specific ECU so far.
+    """
     result = {
-        "mode":          InitMode.SLOW_5BAUD.value,
-        "address_sent":  address,
-        "sync_byte":     None,
-        "key_bytes":     None,
-        "echo_response": None,
-        "success":       False,
-        "reason":        None,
+        "mode": InitMode.TWO_PHASE.value,
+        "address_prestep_used": do_address_prestep,
+        "address_prestep_recv": None,
+        "skip_wake": skip_wake,
+        "ping_recv": None,
+        "diag_recv": None,
+        "success": False,
+        "reason": None,
     }
 
-    sync = ser.read(1)
-    _log_rx("sync_byte", sync)
-    if not sync:
-        result["reason"] = "no_sync_byte"
-        return result
-    result["sync_byte"] = sync[0]
+    if do_address_prestep:
+        logger.debug("Address pre-step: break low=25ms high=25ms, send 0x33")
+        _break_pulse(ser, low_ms=25, high_ms=25)
 
-    key_bytes = ser.read(2)
-    _log_rx("key_bytes", key_bytes)
-    if len(key_bytes) < 2:
-        result["reason"] = "incomplete_key_bytes"
-        return result
-    result["key_bytes"] = list(key_bytes)
+        ser.write(bytes([0x33]))
+        echo = ser.read(1)
+        if echo and echo[0] == 0x33:
+            _log_rx("prestep_echo", echo)
+            ack = ser.read(1)
+        else:
+            ack = echo
 
-    complement = (~key_bytes[1]) & 0xFF
-    _log_tx("complement_of_kb2", [complement])
-    ser.write(bytes([complement]))
+        _log_rx("prestep_ack", ack or [])
+        result["address_prestep_recv"] = list(ack) if ack else []
 
-    echo = ser.read(1)
-    _log_rx("echo_of_complement_addr", echo)
-    result["echo_response"] = echo[0] if echo else None
+        if not ack or ack[0] != 0x31:
+            result["reason"] = "address_prestep_no_ack"
+            return result
 
-    if echo and echo[0] == ((~address) & 0xFF):
-        result["success"] = True
+        # Drain any trailing bytes before moving on.
+        ser.timeout = 0.2
+        while ser.read(1):
+            pass
+        ser.timeout = 1.0
+        time.sleep(0.05)
+
+    if do_address_prestep:
+        # The prestep's own break pulse (25ms/25ms) already served as the
+        # wake-up for this ECU historically -- a SECOND break pulse here
+        # doesn't match the one sequence that has ever actually gotten a
+        # response out of this bike. Skip straight to wake/diag.
+        logger.debug("Address pre-step already ran -- skipping second break pulse")
     else:
-        result["reason"] = "no_or_unexpected_address_complement_echo"
+        logger.debug("Break pulse: low=70ms high=130ms")
+        _break_pulse(ser, low_ms=70, high_ms=130)
+
+    if not skip_wake:
+        ping_resp = send_and_receive(ser, [0xFE], [0x72], label="ping")
+        result["ping_recv"] = ping_resp
+        if ping_resp is None:
+            result["reason"] = "ping_no_response"
+            return result
+
+    diag_resp = send_and_receive(ser, [0x72], [0x00, 0xF0], label="diag")
+    result["diag_recv"] = diag_resp
+    if diag_resp is None:
+        result["reason"] = "diag_no_response"
+        return result
+
+    result["success"] = True
+    result["reason"] = "handshake_complete"
     return result
 
-
-# ---------------------------------------------------------------------------
-# Init Mode 4: Passive sniff
-# ---------------------------------------------------------------------------
 
 def passive_sniff(ser: serial.Serial, duration_s: float = 5.0) -> list:
+    """Listen-only, no transmission. Useful for diagnostics or Y-tap capture."""
     ser.reset_input_buffer()
     captured = bytearray()
     end = time.time() + duration_s
@@ -295,240 +394,119 @@ def passive_sniff(ser: serial.Serial, duration_s: float = 5.0) -> list:
     return list(captured)
 
 
-# ---------------------------------------------------------------------------
-# Init Mode 5: Two-phase (confirmed K45A sequence)
-#
-# Phase 1  : break 25/25ms  ->  send 0x33  ->  expect 0x31
-# Phase 2a : burst FE 04 72 8C  ->  ECU wake ack (expect 0E 04 72 7C)
-# Phase 2b : burst 72 05 00 F0 99  ->  ECU ready ack (expect 02 04 00 FA)
-#
-# All ECU response bytes are captured raw (burst send + window read) so
-# the per-byte collision / interleaving problem from the slow sender is gone.
-# ---------------------------------------------------------------------------
-
-def two_phase_handshake(ser: serial.Serial) -> dict:
-    result = {
-        "mode":        InitMode.TWO_PHASE.value,
-        "phase1_sent": None,
-        "phase1_recv": None,
-        "phase2_sent": None,
-        "phase2_recv": None,
-        "success":     False,
-        "reason":      None,
-    }
-
-    # ------------------------------------------------------------------
-    # Phase 1 — break pulse + address byte
-    # ------------------------------------------------------------------
-    logger.debug("Two-phase P1: break low=25ms high=25ms, address=0x33")
-    _fast_init_pulse(ser, low_ms=25, high_ms=25)
-
-    addr_packet = [0x33]
-    _log_tx("two_phase_p1", addr_packet)
-    ser.write(bytearray(addr_packet))
-
-    # consume our own TX echo of 0x33
-    echo = ser.read(1)
-    if echo and echo[0] == 0x33:
-        _log_rx("two_phase_p1_echo", echo)
-        ack = ser.read(1)
-    else:
-        ack = echo  # no echo present, already the ECU response
-
-    result["phase1_sent"] = addr_packet
-    result["phase1_recv"] = list(ack) if ack else []
-    _log_rx("two_phase_p1_ack", ack)
-
-    if not ack or ack[0] != 0x31:
-        result["reason"] = f"phase1_no_ack (got 0x{ack[0]:02X if ack else 'nothing'})"
-        return result
-
-    # drain any additional bytes the ECU sends after 0x31
-    ser.timeout = 0.2
-    phase1_extra = []
-    while True:
-        b = ser.read(1)
-        if not b:
-            break
-        phase1_extra.append(b[0])
-    ser.timeout = 1.0
-
-    if phase1_extra:
-        _log_rx("two_phase_p1_extra", phase1_extra)
-        logger.debug("ECU phase1 full response: 31 %s",
-                     " ".join(f"{b:02X}" for b in phase1_extra))
-    else:
-        logger.debug("ECU phase1 response was single byte 0x31 only")
-
-    result["phase1_recv"] = [0x31] + phase1_extra
-    logger.debug("Phase 1 complete — bus quiet, proceeding to phase 2")
-    time.sleep(0.05)
-
-    # ------------------------------------------------------------------
-    # Phase 2 — init packet (burst send, raw capture)
-    # K45A goes directly to init after phase 1 -- no separate wake packet
-    # needed unlike K25 which uses FE 04 72 8C first.
-    # 72 05 0F F0 8A is the confirmed K45A init packet from brute-force.
-    # ------------------------------------------------------------------
-    init_packet = [0x72, 0x05, 0x0F, 0xF0, calculate_checksum([0x72, 0x05, 0x0F, 0xF0])]
-    p2_raw      = _send_and_capture(ser, init_packet, "p2_init", window_s=2.0)
-
-    # strip our TX echo (first len(init_packet) bytes)
-    p2_ecu = p2_raw[len(init_packet):]
-    _log_rx("p2_ecu_response", p2_ecu)
-    logger.debug("P2 ECU response: %s",
-                 " ".join(f"{b:02X}" for b in p2_ecu) if p2_ecu else "(none)")
-
-    result["phase2_sent"] = init_packet
-    result["phase2_recv"] = p2_ecu
-    result["success"]     = True
-    result["reason"]      = "p2_complete"
-    return result
-
-# ---------------------------------------------------------------------------
-# Unified entry point
-# ---------------------------------------------------------------------------
-
-def perform_handshake(ser: serial.Serial,
-                       mode: InitMode = InitMode.FAST_KEIHIN,
+def perform_handshake(ser: serial.Serial, mode: InitMode = InitMode.TWO_PHASE,
                        **kwargs) -> dict:
-    if mode in (InitMode.FAST_KEIHIN, InitMode.FAST_ISO14230):
-        return fast_init_handshake(ser, mode=mode)
-    if mode == InitMode.SLOW_5BAUD:
-        return slow_init_handshake(ser, **kwargs)
     if mode == InitMode.TWO_PHASE:
-        return two_phase_handshake(ser)
+        return two_phase_handshake(ser, **kwargs)
     if mode == InitMode.PASSIVE_SNIFF:
         captured = passive_sniff(ser, **kwargs)
         return {
-            "mode":     mode.value,
+            "mode": mode.value,
             "captured": captured,
-            "success":  len(captured) > 0,
-            "reason":   None if captured else "no_bytes_observed",
+            "success": len(captured) > 0,
+            "reason": None if captured else "no_bytes_observed",
         }
     raise ValueError(f"Unknown init mode: {mode}")
 
 
-def sweep_init_modes(port: str, baudrate: int, timeout: float,
-                      delay_between_s: float = 1.0) -> dict:
-    results = {}
-    for mode in (InitMode.FAST_KEIHIN, InitMode.FAST_ISO14230, InitMode.SLOW_5BAUD):
-        ser = open_connection(port, baudrate, timeout)
-        try:
-            results[mode.value] = perform_handshake(ser, mode=mode)
-        except Exception as exc:
-            results[mode.value] = {
-                "mode": mode.value, "success": False,
-                "reason": f"exception: {exc}",
-            }
-        finally:
-            ser.close()
-        time.sleep(delay_between_s)
-    return results
-
-
 # ---------------------------------------------------------------------------
-# Table query
-#
-# Sent as a single burst. ECU response starts immediately after it receives
-# the first byte, so by the time our burst finishes, the ECU response is
-# already on the wire. We capture everything in a raw window, then strip
-# our own TX echo (first len(packet) bytes) to get the clean ECU frame.
+# Table reading
 # ---------------------------------------------------------------------------
 
 def query_table(ser: serial.Serial, table_id: int) -> list | None:
     """
-    Combined strategy:
-      Plan A - extended response window (8s instead of 2s)
-      Plan E - tiny keep-alive ping before the real query
-      Plan B - try alternate query formats if standard one gives only ACK
+    Reads a data table. Confirmed format: mtype=[0x72], data=[0x71, table_id].
+    Returns the response payload (which includes an echo of [0x71, table_id,
+    <request_checksum>] as its first 3 bytes, followed by the actual table
+    data), or None if the table is invalid/unsupported or the read failed.
     """
-    # Plan E: keep-alive ping -- single 0x00 byte, ignore response,
-    # just to keep the ECU session alive before the real query
-    ser.write(bytes([0x00]))
-    time.sleep(0.02)
-    ser.reset_input_buffer()
-
-    candidates = [
-        ("standard_71", build_packet(MODE_QUERY, table_id)),
-        ("single_byte_table", [table_id]),
-        ("single_byte_71", [MODE_QUERY]),
-        ("no_checksum", [HEADER_REQUEST, 0x04, MODE_QUERY, table_id]),
-    ]
-
-    for label, packet in candidates:
-        ser.reset_input_buffer()
-        ser.reset_output_buffer()
-
-        _log_tx(f"query_table 0x{table_id:02X} [{label}]", packet)
-        ser.write(bytearray(packet))
-
-        # Plan A: extended window, 8 seconds
-        ser.timeout = 0.05
-        everything = bytearray()
-        deadline = time.time() + 8.0
-        while time.time() < deadline:
-            chunk = ser.read(64)
-            if chunk:
-                everything.extend(chunk)
-                # if we've gone quiet for a bit after getting something, stop early
-                if len(everything) > len(packet):
-                    quiet_deadline = time.time() + 0.3
-                    while time.time() < quiet_deadline:
-                        more = ser.read(64)
-                        if more:
-                            everything.extend(more)
-                            quiet_deadline = time.time() + 0.3
-                    break
-        ser.timeout = 1.0
-
-        _log_rx(f"query_everything 0x{table_id:02X} [{label}]", list(everything))
-
-        if not everything:
-            continue
-
-        # Extract ECU bytes: anything beyond our TX length, plus any byte
-        # that differs from what we sent within TX length
-        ecu_bytes = bytearray()
-        for i in range(len(everything)):
-            if i >= len(packet):
-                ecu_bytes.append(everything[i])
-            elif everything[i] != packet[i]:
-                ecu_bytes.append(everything[i])
-
-        _log_rx(f"query_ecu_extracted 0x{table_id:02X} [{label}]", list(ecu_bytes))
-
-        # If we got MORE than just a 1-byte ACK-flip, this is real data
-        if len(ecu_bytes) > 1:
-            logger.debug("*** REAL DATA [%s]: %s", label,
-                        " ".join(f"{b:02X}" for b in ecu_bytes))
-            if ecu_bytes and ecu_bytes[0] != 0xFF:
-                return list(ecu_bytes)
-
-        time.sleep(0.1)
-
-    return None
+    return send_and_receive(ser, [0x72], [0x71, table_id],
+                             label=f"read_table_0x{table_id:02X}")
 
 
-# ---------------------------------------------------------------------------
-# Table probe sweep
-# ---------------------------------------------------------------------------
+def read_vin(ser: serial.Serial) -> list | None:
+    """VIN is just table 0x00."""
+    return query_table(ser, VIN_TABLE)
 
-def probe_tables(ser: serial.Serial,
-                  start: int = 0x00,
-                  end:   int = 0xFF) -> dict:
+
+def read_live_data(ser: serial.Serial) -> list | None:
+    """Confirmed live telemetry table."""
+    return query_table(ser, LIVE_DATA_TABLE)
+
+
+def probe_known_tables(ser: serial.Serial) -> dict:
+    """
+    Checks only the confirmed-valid table list from eculib/honda.py,
+    instead of blindly sweeping 0x00-0xFF. Much faster and grounded in
+    real reference data rather than guesswork.
+    """
+    results = {}
+    for table_id in KNOWN_TABLES:
+        resp = query_table(ser, table_id)
+        if resp is not None:
+            results[table_id] = {"status": "ACTIVE", "length": len(resp), "raw_bytes": resp}
+        else:
+            results[table_id] = {"status": "INACTIVE"}
+    return results
+
+
+def probe_tables(ser: serial.Serial, start: int = 0x00, end: int = 0xFF) -> dict:
+    """
+    Full range sweep, kept as a utility for further exploration beyond the
+    confirmed table list (e.g. if this ECU has extra vendor-specific tables
+    not in the reference list). Much less likely to be needed now, but
+    harmless to keep since it uses the corrected send_and_receive logic.
+    """
     results = {}
     for table_id in range(start, end + 1):
         try:
             resp = query_table(ser, table_id)
-            if resp is None:
-                results[table_id] = {"status": "INACTIVE"}
+            if resp is not None:
+                results[table_id] = {"status": "ACTIVE", "length": len(resp), "raw_bytes": resp}
             else:
-                results[table_id] = {
-                    "status":    "ACTIVE",
-                    "length":    len(resp),
-                    "raw_bytes": resp,
-                }
+                results[table_id] = {"status": "INACTIVE"}
         except Exception:
             results[table_id] = {"status": "ERROR"}
     return results
+
+
+# ---------------------------------------------------------------------------
+# Fault codes -- ported from eculib/honda.py get_faults()
+# ---------------------------------------------------------------------------
+
+def get_faults(ser: serial.Serial) -> dict:
+    """
+    Reads current and past DTCs. Ported from eculib.honda.HondaECU.get_faults().
+    Fault data format: response payload starts with a 3-byte echo of our own
+    request tail ([0x74 or 0x73, index, our_checksum]), followed by fault
+    code pairs at fixed offsets.
+    """
+    faults = {"past": [], "current": []}
+
+    for i in range(1, 0x0C):
+        resp = send_and_receive(ser, [0x72], [0x74, i], label=f"dtc_current_{i}")
+        if resp is None:
+            break
+        for j in (3, 5, 7):
+            if j + 1 < len(resp) and resp[j] != 0:
+                faults["current"].append(f"{resp[j]:02d}-{resp[j+1]:02d}")
+        if len(resp) > 2 and resp[2] == 0:
+            break
+
+    for i in range(1, 0x0C):
+        resp = send_and_receive(ser, [0x72], [0x73, i], label=f"dtc_past_{i}")
+        if resp is None:
+            break
+        for j in (3, 5, 7):
+            if j + 1 < len(resp) and resp[j] != 0:
+                faults["past"].append(f"{resp[j]:02d}-{resp[j+1]:02d}")
+        if len(resp) > 2 and resp[2] == 0:
+            break
+
+    return faults
+
+
+def clear_faults(ser: serial.Serial) -> bool:
+    """Clear DTCs. Confirmed format: mtype=[0x72], data=[0x60, 0x01]."""
+    resp = send_and_receive(ser, [0x72], [0x60, 0x01], label="clear_dtc")
+    return resp is not None

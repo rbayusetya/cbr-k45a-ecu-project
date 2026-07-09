@@ -1,47 +1,99 @@
 connection:
-  port: "/dev/ttyUSB0"
+  port: /dev/ttyUSB0
   baudrate: 10400
   timeout: 1.0
 
-active_table: 0x11
+# Default table to stream with 'live' command.
+# 0x17 is the CONFIRMED live telemetry table (from eculib/honda.py and the
+# Scribd Honda Kline Command Protocol Guide). The old default of 0x11 was
+# never valid on this ECU family.
+active_table: 0x17
 
 tables:
-  0x11:
+  0x17:
     name: "Live Telemetry"
-    expected_length: 24
+    # query_table() returns rdata = full_response[ml+1:-1], which includes
+    # a 3-byte echo of our own request tail ([0x71, 0x17, our_checksum])
+    # BEFORE the real sensor bytes start. Offsets below account for that
+    # 3-byte prefix -- real data starts at offset 3.
+    expected_length: 21
     parameters:
-      engine_rpm:
-        offset: 4
+      # --- CONFIRMED FIELD LAYOUT (from a real captured session) ---
+      # NOTE: the BYTE POSITIONS below are confirmed (RPM at offset 3-4,
+      # TPS1 at offset 5, etc. -- this ordering is real). The FORMULAS are
+      # NOT yet confirmed for this specific bike/ECU -- they are raw
+      # pass-through placeholders. Do not trust the "value" numbers until
+      # each one has been calibrated against a known reference (tachometer
+      # for RPM, a thermometer for ECT/IAT, a multimeter on the battery
+      # terminal for BAT, etc.) -- see the diff-capture idea from earlier:
+      # compare readings at ignition-on vs idle vs revved to confirm which
+      # bytes move and how.
+      rpm:
+        offset: 3
         length: 2
-        endian: "big"
-        formula: "x"
-        unit: "RPM"
-      throttle_position:
+        endian: big
+        formula: "x"        # TODO: confirm scaling against a tachometer
+        unit: "raw"
+      tps1:
+        offset: 5
+        length: 1
+        formula: "x"        # TODO: confirm against known throttle position (0%/100%)
+        unit: "raw"
+      tps2:
         offset: 6
         length: 1
-        endian: "big"
-        formula: "x * 0.784"
-        unit: "%"
-      coolant_temp:
+        formula: "x"
+        unit: "raw"
+      ect1:
         offset: 7
         length: 1
-        endian: "big"
-        formula: "x - 40"
-        unit: "°C"
-      voltage:
-        offset: 12
-        length: 2
-        endian: "big"
-        formula: "x / 100"
-        unit: "V"
-
-  0x12:
-    name: "DTC Engine Codes"
-    expected_length: 12
-    parameters:
-      active_errors:
-        offset: 4
+        formula: "x"        # TODO: confirm against a thermometer on the engine
+        unit: "raw"
+      ect2:
+        offset: 8
         length: 1
-        endian: "big"
         formula: "x"
-        unit: "count"
+        unit: "raw"
+      iat1:
+        offset: 9
+        length: 1
+        formula: "x"        # TODO: confirm against ambient/intake temperature
+        unit: "raw"
+      iat2:
+        offset: 10
+        length: 1
+        formula: "x"
+        unit: "raw"
+      map1:
+        offset: 11
+        length: 1
+        formula: "x"        # TODO: confirm against a manifold pressure reference
+        unit: "raw"
+      map2:
+        offset: 12
+        length: 1
+        formula: "x"
+        unit: "raw"
+      battery:
+        offset: 13
+        length: 1
+        formula: "x"        # TODO: confirm against a multimeter on the battery terminal
+        unit: "raw"
+      injector:
+        offset: 14
+        length: 1
+        formula: "x"
+        unit: "raw"
+      ignition_timing:
+        offset: 15
+        length: 1
+        formula: "x"
+        unit: "raw"
+      speed:
+        offset: 16
+        length: 1
+        formula: "x"        # TODO: confirm against a known road speed (GPS app, etc.)
+        unit: "raw"
+      # Bytes 17-20 are unlabeled/reserved in the reference capture we
+      # found -- left out here until we know what they are. Use
+      # `read-table 0x17` to inspect the full raw response directly.

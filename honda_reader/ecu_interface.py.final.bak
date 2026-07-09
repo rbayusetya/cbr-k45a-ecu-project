@@ -1,0 +1,863 @@
+"""
+Honda Keihin K-Line ECU interface.
+
+Reworked for reverse-engineering an undocumented ECU (Honda CBR150R K45A,
+Indonesian market). Since there is no factory spec to confirm the wake-up
+protocol, this module supports SEVERAL candidate init strategies and gives
+raw on-the-wire visibility (--debug logging) so you can empirically figure
+out which one the ECU actually responds to, rather than betting everything
+on a single hardcoded sequence.
+
+Supported init modes (see InitMode):
+    fast_keihin     - "Fast Init" break low 70ms / high 120ms (common in
+                       aftermarket Keihin K-line tools / clone cables)
+    fast_iso14230   - Standard ISO14230 Fast Init: low 25ms / high 25ms
+    slow_5baud      - ISO9141-2 style 5-baud slow init: bit-bang address
+                       byte 0x10 at 5 baud, then look for sync (0x55) +
+                       2 key bytes
+    passive_sniff   - No init at all. Just open the port and log whatever
+                       the ECU/bus does on its own.
+    two_phase       - Confirmed K45A sequence:
+                       P1: break 25/25ms + 0x33 -> 0x31 ack
+                       P2a: burst FE 04 72 8C -> ECU wake ack
+                       P2b: burst 72 05 00 F0 99 -> ECU ready ack
+"""
+
+import logging
+import time
+from enum import Enum
+
+import serial
+
+logger = logging.getLogger("honda_reader.ecu")
+
+HEADER_REQUEST  = 0x72
+HEADER_RESPONSE = 0x02
+MODE_QUERY      = 0x71
+MODE_HANDSHAKE  = 0x0F
+
+HANDSHAKE_REQUEST = [0x72, 0x05, 0x0F, 0xF0]
+SLOW_INIT_ADDRESS = 0x10
+
+
+class InitMode(str, Enum):
+    FAST_KEIHIN   = "fast_keihin"
+    FAST_ISO14230 = "fast_iso14230"
+    SLOW_5BAUD    = "slow_5baud"
+    PASSIVE_SNIFF = "passive_sniff"
+    TWO_PHASE     = "two_phase"
+
+
+FAST_INIT_TIMINGS = {
+    InitMode.FAST_KEIHIN:   {"low_ms": 70,  "high_ms": 120},
+    InitMode.FAST_ISO14230: {"low_ms": 25,  "high_ms": 25},
+}
+
+
+# ---------------------------------------------------------------------------
+# Checksum / packet helpers
+# ---------------------------------------------------------------------------
+
+def calculate_checksum(packet: list) -> int:
+    """Standard Keihin 8-bit subtraction checksum."""
+    return (0x100 - (sum(packet) & 0xFF)) & 0xFF
+
+
+def verify_checksum(packet: list) -> bool:
+    if len(packet) < 2:
+        return False
+    data_sum  = sum(packet[:-1]) & 0xFF
+    expected  = (0x100 - data_sum) & 0xFF
+    return packet[-1] == expected
+
+
+def build_packet(mode: int, table_id: int, data_bytes: list | None = None) -> list:
+    data    = data_bytes or []
+    payload = [HEADER_REQUEST, 0, mode, table_id] + data
+    payload[1] = len(payload) + 1
+    return payload + [calculate_checksum(payload)]
+
+
+# ---------------------------------------------------------------------------
+# Raw-byte logging helpers
+# ---------------------------------------------------------------------------
+
+def _hex(data) -> str:
+    return " ".join(f"{b:02X}" for b in data) if data else "(none)"
+
+def _log_tx(label: str, data) -> None:
+    logger.debug("TX [%s]: %s", label, _hex(data))
+
+def _log_rx(label: str, data) -> None:
+    logger.debug("RX [%s]: %s", label, _hex(data))
+
+
+# ---------------------------------------------------------------------------
+# Connection management
+# ---------------------------------------------------------------------------
+
+def open_connection(port: str, baudrate: int, timeout: float) -> serial.Serial:
+    return serial.Serial(
+        port=port,
+        baudrate=baudrate,
+        bytesize=serial.EIGHTBITS,
+        parity=serial.PARITY_NONE,
+        stopbits=serial.STOPBITS_ONE,
+        timeout=timeout,
+    )
+
+def _reopen_baud(ser: serial.Serial, baudrate: int) -> None:
+    ser.baudrate = baudrate
+    ser.reset_input_buffer()
+    ser.reset_output_buffer()
+
+
+# ---------------------------------------------------------------------------
+# Core send+capture primitive
+# Used everywhere we need to see raw wire bytes without echo filtering.
+# Sends the packet as a single burst, then reads everything on the wire
+# for window_s seconds and returns ALL bytes (our echo + ECU response).
+# Callers strip the echo by slicing off len(packet) bytes from the front.
+# ---------------------------------------------------------------------------
+
+def _send_and_capture(ser: serial.Serial, packet: list, label: str,
+                      window_s: float = 2.0) -> list:
+    ser.reset_input_buffer()
+    ser.reset_output_buffer()
+
+    _log_tx(label, packet)
+    ser.write(bytearray(packet))
+
+    ser.timeout = 0.05
+    raw      = bytearray()
+    deadline = time.time() + window_s
+    while time.time() < deadline:
+        chunk = ser.read(64)
+        if chunk:
+            raw.extend(chunk)
+    ser.timeout = 1.0
+
+    _log_rx(f"{label}_raw", list(raw))
+    return list(raw)
+
+
+# ---------------------------------------------------------------------------
+# Init Mode 1 & 2: Fast Init (break-pulse based)
+# ---------------------------------------------------------------------------
+
+def _fast_init_pulse(ser: serial.Serial, low_ms: int, high_ms: int) -> None:
+    ser.break_condition = True
+    time.sleep(low_ms / 1000.0)
+    ser.break_condition = False
+    time.sleep(high_ms / 1000.0)
+    ser.reset_input_buffer()
+    ser.reset_output_buffer()
+
+
+def _read_with_echo_cancel(ser: serial.Serial, sent_packet: list,
+                            n_response_bytes: int):
+    first_byte = ser.read(1)
+    if not first_byte:
+        return None
+    first_val = first_byte[0]
+
+    if first_val == sent_packet[0]:
+        remaining_echo = len(sent_packet) - 1
+        echoed = ser.read(remaining_echo) if remaining_echo > 0 else b""
+        _log_rx("echo", bytes([first_val]) + echoed)
+        first_byte = ser.read(1)
+        if not first_byte:
+            return None
+        first_val = first_byte[0]
+
+    rest     = ser.read(max(n_response_bytes - 1, 0))
+    response = [first_val] + list(rest)
+    _log_rx("response", response)
+    return response
+
+
+def fast_init_handshake(ser: serial.Serial,
+                         mode: InitMode = InitMode.FAST_KEIHIN) -> dict:
+    timing = FAST_INIT_TIMINGS[mode]
+    logger.debug("Fast init (%s): low=%dms high=%dms",
+                 mode.value, timing["low_ms"], timing["high_ms"])
+    _fast_init_pulse(ser, timing["low_ms"], timing["high_ms"])
+
+    cs     = calculate_checksum(HANDSHAKE_REQUEST)
+    packet = HANDSHAKE_REQUEST + [cs]
+    _log_tx(mode.value, packet)
+    ser.write(bytearray(packet))
+
+    response = _read_with_echo_cancel(ser, packet, n_response_bytes=5)
+
+    result = {
+        "mode":     mode.value,
+        "sent":     packet,
+        "received": response,
+        "success":  False,
+        "reason":   None,
+    }
+
+    if response is None:
+        result["reason"] = "timeout_no_response"
+        return result
+    if response[0] != HEADER_RESPONSE:
+        result["reason"] = f"unexpected_header_0x{response[0]:02X}"
+        return result
+    if len(response) < 5:
+        result["reason"] = "short_response"
+        return result
+    if not verify_checksum(response):
+        result["reason"] = "checksum_mismatch"
+        return result
+
+    result["success"] = response[2] == 0x0F and response[3] == 0xF0
+    if not result["success"]:
+        result["reason"] = "unexpected_payload"
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Init Mode 3: ISO9141-2 5-baud slow init
+# ---------------------------------------------------------------------------
+
+def _send_bit_banged_byte(ser: serial.Serial, byte_val: int,
+                           bit_ms: float) -> None:
+    bits  = [0]
+    bits += [(byte_val >> i) & 1 for i in range(8)]
+    bits += [1]
+    for bit in bits:
+        ser.break_condition = (bit == 0)
+        time.sleep(bit_ms / 1000.0)
+    ser.break_condition = False
+
+
+def slow_init_handshake(ser: serial.Serial,
+                         address: int   = SLOW_INIT_ADDRESS,
+                         target_baud: int = 10400,
+                         key_wait_s: float = 2.0) -> dict:
+    logger.debug("Slow init: address=0x%02X bit_time=200ms", address)
+    _send_bit_banged_byte(ser, address, bit_ms=200.0)
+    _reopen_baud(ser, target_baud)
+
+    result = {
+        "mode":          InitMode.SLOW_5BAUD.value,
+        "address_sent":  address,
+        "sync_byte":     None,
+        "key_bytes":     None,
+        "echo_response": None,
+        "success":       False,
+        "reason":        None,
+    }
+
+    sync = ser.read(1)
+    _log_rx("sync_byte", sync)
+    if not sync:
+        result["reason"] = "no_sync_byte"
+        return result
+    result["sync_byte"] = sync[0]
+
+    key_bytes = ser.read(2)
+    _log_rx("key_bytes", key_bytes)
+    if len(key_bytes) < 2:
+        result["reason"] = "incomplete_key_bytes"
+        return result
+    result["key_bytes"] = list(key_bytes)
+
+    complement = (~key_bytes[1]) & 0xFF
+    _log_tx("complement_of_kb2", [complement])
+    ser.write(bytes([complement]))
+
+    echo = ser.read(1)
+    _log_rx("echo_of_complement_addr", echo)
+    result["echo_response"] = echo[0] if echo else None
+
+    if echo and echo[0] == ((~address) & 0xFF):
+        result["success"] = True
+    else:
+        result["reason"] = "no_or_unexpected_address_complement_echo"
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Init Mode 4: Passive sniff
+# ---------------------------------------------------------------------------
+
+def passive_sniff(ser: serial.Serial, duration_s: float = 5.0) -> list:
+    ser.reset_input_buffer()
+    captured = bytearray()
+    end = time.time() + duration_s
+    while time.time() < end:
+        chunk = ser.read(64)
+        if chunk:
+            captured.extend(chunk)
+            _log_rx("sniff", chunk)
+    return list(captured)
+
+
+# ---------------------------------------------------------------------------
+# Init Mode 5: Two-phase (confirmed K45A sequence)
+#
+# Phase 1  : break 25/25ms  ->  send 0x33  ->  expect 0x31
+# Phase 2a : burst FE 04 72 8C  ->  ECU wake ack (expect 0E 04 72 7C)
+# Phase 2b : burst 72 05 00 F0 99  ->  ECU ready ack (expect 02 04 00 FA)
+#
+# All ECU response bytes are captured raw (burst send + window read) so
+# the per-byte collision / interleaving problem from the slow sender is gone.
+# ---------------------------------------------------------------------------
+
+def two_phase_handshake(ser: serial.Serial) -> dict:
+    result = {
+        "mode":         InitMode.TWO_PHASE.value,
+        "phase1_sent":  None,
+        "phase1_recv":  None,
+        "phase2_sent":  None,
+        "phase2_recv":  None,
+        "success":      False,
+        "reason":       None,
+    }
+
+    # ------------------------------------------------------------------
+    # Phase 1 — break pulse + address byte
+    # ------------------------------------------------------------------
+    logger.debug("Two-phase P1: break low=25ms high=25ms, address=0x33")
+    _fast_init_pulse(ser, low_ms=25, high_ms=25)
+
+    addr_packet = [0x33]
+    _log_tx("two_phase_p1", addr_packet)
+    ser.write(bytearray(addr_packet))
+
+    # consume our own TX echo of 0x33
+    echo = ser.read(1)
+    if echo and echo[0] == 0x33:
+        _log_rx("two_phase_p1_echo", echo)
+        ack = ser.read(1)
+    else:
+        ack = echo  # no echo present, already the ECU response
+
+    result["phase1_sent"] = addr_packet
+    result["phase1_recv"] = list(ack) if ack else []
+    _log_rx("two_phase_p1_ack", ack)
+
+    if not ack or ack[0] != 0x31:
+        result["reason"] = f"phase1_no_ack (got 0x{ack[0]:02X if ack else 'nothing'})"
+        return result
+
+    # drain any additional bytes the ECU sends after 0x31
+    ser.timeout = 0.2
+    phase1_extra = []
+    while True:
+        b = ser.read(1)
+        if not b:
+            break
+        phase1_extra.append(b[0])
+    ser.timeout = 1.0
+
+    if phase1_extra:
+        _log_rx("two_phase_p1_extra", phase1_extra)
+        logger.debug("ECU phase1 full response: 31 %s",
+                     " ".join(f"{b:02X}" for b in phase1_extra))
+    else:
+        logger.debug("ECU phase1 response was single byte 0x31 only")
+
+    result["phase1_recv"] = [0x31] + phase1_extra
+    logger.debug("Phase 1 complete — bus quiet, proceeding to phase 2")
+    time.sleep(0.05)
+
+    # ------------------------------------------------------------------
+    # Phase 2 — init packet (burst send, raw capture)
+    # K45A goes directly to init after phase 1 -- no separate wake packet
+    # needed (unlike K25 reference which uses FE 04 72 8C first; that step
+    # was tested and confirmed NOT to work on this ECU).
+    # 72 05 0F F0 8A is the confirmed K45A init packet from brute-force.
+    # ------------------------------------------------------------------
+    init_packet = [0x72, 0x05, 0x0F, 0xF0,
+                   calculate_checksum([0x72, 0x05, 0x0F, 0xF0])]
+    p2_raw = _send_and_capture(ser, init_packet, "p2_init", window_s=2.0)
+
+    p2_ecu = p2_raw[len(init_packet):]
+    _log_rx("p2_ecu_response", p2_ecu)
+    logger.debug("P2 ECU response: %s",
+                 " ".join(f"{b:02X}" for b in p2_ecu) if p2_ecu else "(none)")
+
+    result["phase2_sent"] = init_packet
+    result["phase2_recv"] = p2_ecu
+    result["success"] = True
+    result["reason"] = "p2_complete"
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Unified entry point
+# ---------------------------------------------------------------------------
+
+def perform_handshake(ser: serial.Serial,
+                       mode: InitMode = InitMode.FAST_KEIHIN,
+                       **kwargs) -> dict:
+    if mode in (InitMode.FAST_KEIHIN, InitMode.FAST_ISO14230):
+        return fast_init_handshake(ser, mode=mode)
+    if mode == InitMode.SLOW_5BAUD:
+        return slow_init_handshake(ser, **kwargs)
+    if mode == InitMode.TWO_PHASE:
+        return two_phase_handshake(ser)
+    if mode == InitMode.PASSIVE_SNIFF:
+        captured = passive_sniff(ser, **kwargs)
+        return {
+            "mode":     mode.value,
+            "captured": captured,
+            "success":  len(captured) > 0,
+            "reason":   None if captured else "no_bytes_observed",
+        }
+    raise ValueError(f"Unknown init mode: {mode}")
+
+
+def sweep_init_modes(port: str, baudrate: int, timeout: float,
+                      delay_between_s: float = 1.0) -> dict:
+    results = {}
+    for mode in (InitMode.FAST_KEIHIN, InitMode.FAST_ISO14230, InitMode.SLOW_5BAUD):
+        ser = open_connection(port, baudrate, timeout)
+        try:
+            results[mode.value] = perform_handshake(ser, mode=mode)
+        except Exception as exc:
+            results[mode.value] = {
+                "mode": mode.value, "success": False,
+                "reason": f"exception: {exc}",
+            }
+        finally:
+            ser.close()
+        time.sleep(delay_between_s)
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Table query
+#
+# Sent as a single burst. ECU response starts immediately after it receives
+# the first byte, so by the time our burst finishes, the ECU response is
+# already on the wire. We capture everything in a raw window, then strip
+# our own TX echo (first len(packet) bytes) to get the clean ECU frame.
+# ---------------------------------------------------------------------------
+
+def query_table(ser: serial.Serial, table_id: int) -> list | None:
+    """
+    Combined strategy from Plan A/E/B testing:
+      Plan A - extended response window (8s instead of 2s)
+      Plan E - tiny keep-alive ping before the real query
+      Plan B - try alternate query formats if standard one gives only ACK
+    """
+    # Plan E: keep-alive ping -- single 0x00 byte, ignore response,
+    # just to keep the ECU session alive before the real query
+    ser.write(bytes([0x00]))
+    time.sleep(0.02)
+    ser.reset_input_buffer()
+
+    candidates = [
+        ("standard_71", build_packet(MODE_QUERY, table_id)),
+        ("single_byte_table", [table_id]),
+        ("single_byte_71", [MODE_QUERY]),
+        ("no_checksum", [HEADER_REQUEST, 0x04, MODE_QUERY, table_id]),
+    ]
+
+    for label, packet in candidates:
+        ser.reset_input_buffer()
+        ser.reset_output_buffer()
+
+        _log_tx(f"query_table 0x{table_id:02X} [{label}]", packet)
+        ser.write(bytearray(packet))
+
+        # Plan A: extended window, 8 seconds, with quiet-period early exit
+        ser.timeout = 0.05
+        everything = bytearray()
+        deadline = time.time() + 8.0
+        while time.time() < deadline:
+            chunk = ser.read(64)
+            if chunk:
+                everything.extend(chunk)
+                if len(everything) > len(packet):
+                    quiet_deadline = time.time() + 0.3
+                    while time.time() < quiet_deadline:
+                        more = ser.read(64)
+                        if more:
+                            everything.extend(more)
+                            quiet_deadline = time.time() + 0.3
+                    break
+        ser.timeout = 1.0
+
+        _log_rx(f"query_everything 0x{table_id:02X} [{label}]", list(everything))
+
+        if not everything:
+            continue
+
+        ecu_bytes = bytearray()
+        for i in range(len(everything)):
+            if i >= len(packet):
+                ecu_bytes.append(everything[i])
+            elif everything[i] != packet[i]:
+                ecu_bytes.append(everything[i])
+
+        _log_rx(f"query_ecu_extracted 0x{table_id:02X} [{label}]", list(ecu_bytes))
+
+        if len(ecu_bytes) > 1:
+            logger.debug("*** REAL DATA [%s]: %s", label,
+                        " ".join(f"{b:02X}" for b in ecu_bytes))
+            if ecu_bytes and ecu_bytes[0] != 0xFF:
+                return list(ecu_bytes)
+
+        time.sleep(0.1)
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Table probe sweep
+# ---------------------------------------------------------------------------
+
+def probe_tables(ser: serial.Serial,
+                  start: int = 0x00,
+                  end:   int = 0xFF) -> dict:
+    results = {}
+    for table_id in range(start, end + 1):
+        try:
+            resp = query_table(ser, table_id)
+            if resp is None:
+                results[table_id] = {"status": "INACTIVE"}
+            else:
+                results[table_id] = {
+                    "status":    "ACTIVE",
+                    "length":    len(resp),
+                    "raw_bytes": resp,
+                }
+        except Exception:
+            results[table_id] = {"status": "ERROR"}
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Service byte sweep
+#
+# standard_71 query format has only ever returned the ACK bit-flip (0x05),
+# never real data. Rather than assume 0x71 is the correct "read live data"
+# service ID, sweep the whole byte range 0x00-0xFF in that position while
+# keeping everything else constant, and log every result to file so a
+# crash/Ctrl-C loses nothing.
+# ---------------------------------------------------------------------------
+
+def service_byte_probe_one(ser: serial.Serial, service_byte: int,
+                            table_id: int = 0x11) -> dict:
+    """
+    Sends [0x72, len, service_byte, table_id, checksum] and captures
+    everything on the wire. Returns a dict describing what came back.
+    """
+    payload = [HEADER_REQUEST, 0, service_byte, table_id]
+    payload[1] = len(payload) + 1
+    packet = payload + [calculate_checksum(payload)]
+
+    ser.reset_input_buffer()
+    ser.reset_output_buffer()
+    ser.write(bytearray(packet))
+
+    ser.timeout = 0.05
+    everything = bytearray()
+    deadline = time.time() + 1.5
+    while time.time() < deadline:
+        chunk = ser.read(64)
+        if chunk:
+            everything.extend(chunk)
+    ser.timeout = 1.0
+
+    ecu_bytes = bytearray()
+    for i in range(len(everything)):
+        if i >= len(packet):
+            ecu_bytes.append(everything[i])
+        elif everything[i] != packet[i]:
+            ecu_bytes.append(everything[i])
+
+    return {
+        "service_byte": service_byte,
+        "sent": packet,
+        "raw": list(everything),
+        "ecu_bytes": list(ecu_bytes),
+    }
+
+
+def service_byte_sweep(ser: serial.Serial, output_path: str,
+                        table_id: int = 0x11,
+                        start: int = 0x00, end: int = 0xFF,
+                        delay_between_s: float = 0.05) -> int:
+    """
+    Sweeps service_byte from start to end, writes every result to
+    output_path incrementally (plain text, one line per attempt).
+    Returns count of "interesting" hits (more than 1 ecu byte back,
+    and not just the single-byte ACK-flip pattern).
+    """
+    import json
+
+    interesting_count = 0
+
+    with open(output_path, "a") as f:
+        f.write(f"\n=== Service byte sweep, table_id=0x{table_id:02X} ===\n")
+        f.flush()
+
+        for sb in range(start, end + 1):
+            print(f"\r  Trying service byte 0x{sb:02X}...", end="", flush=True)
+            try:
+                r = service_byte_probe_one(ser, sb, table_id=table_id)
+            except Exception as exc:
+                f.write(f"0x{sb:02X}  ERROR  {exc}\n")
+                f.flush()
+                continue
+
+            sent_hex = " ".join(f"{b:02X}" for b in r["sent"])
+            ecu_hex  = " ".join(f"{b:02X}" for b in r["ecu_bytes"]) if r["ecu_bytes"] else "(none)"
+            raw_hex  = " ".join(f"{b:02X}" for b in r["raw"]) if r["raw"] else "(none)"
+
+            line = f"0x{sb:02X}  sent=[{sent_hex}]  raw=[{raw_hex}]  ecu_bytes=[{ecu_hex}]"
+
+            # Flag anything beyond a single byte as potentially interesting
+            if len(r["ecu_bytes"]) > 1:
+                interesting_count += 1
+                line = "*** " + line
+                print(f"\n  {line}")
+
+            f.write(line + "\n")
+            f.flush()
+
+            time.sleep(delay_between_s)
+
+        f.write(f"=== Done. Interesting (>1 byte) results: {interesting_count} ===\n")
+
+    print(f"\nSweep complete. Interesting results: {interesting_count}")
+    return interesting_count
+
+
+# ---------------------------------------------------------------------------
+# Candidate verifier
+#
+# A single sweep pass can't distinguish real ECU data from a one-off
+# collision artifact (our own TX byte getting corrupted mid-flight, which
+# looks different every time depending on exact timing). This re-runs each
+# flagged service byte multiple times and checks for consistency.
+# A truly real response should come back byte-for-byte identical every time;
+# a collision artifact will vary between repeats.
+# ---------------------------------------------------------------------------
+
+def verify_candidates(ser: serial.Serial, candidates: list, table_id: int = 0x11,
+                       repeats: int = 5, delay_between_s: float = 0.15) -> dict:
+    """
+    Re-runs service_byte_probe_one() `repeats` times for each candidate
+    service byte. Returns a dict keyed by service byte with:
+        {
+            "results": [list of ecu_bytes tuples per repeat],
+            "consistent": bool,
+            "consensus": tuple or None,  # the repeated value, if consistent
+        }
+    Prints a live summary as it goes so you don't have to wait for
+    everything to finish to see what's shaping up.
+    """
+    verdicts = {}
+
+    print(f"\nVerifying {len(candidates)} candidate(s), {repeats} repeats each...")
+    print("-" * 60)
+
+    for sb in candidates:
+        results = []
+        for _ in range(repeats):
+            try:
+                r = service_byte_probe_one(ser, sb, table_id=table_id)
+                results.append(tuple(r["ecu_bytes"]))
+            except Exception as exc:
+                results.append(("ERROR", str(exc)))
+            time.sleep(delay_between_s)
+
+        unique = set(results)
+        # "consistent" means every repeat gave the exact same non-empty result
+        consistent = (len(unique) == 1) and (results[0] not in ((), )) and \
+                     not (len(results[0]) >= 1 and results[0][0] == "ERROR")
+        consensus = results[0] if consistent else None
+
+        verdicts[sb] = {
+            "results": results,
+            "consistent": consistent,
+            "consensus": consensus,
+        }
+
+        results_str = " | ".join(
+            " ".join(f"{b:02X}" for b in r) if r and r[0] != "ERROR" else "ERROR"
+            for r in results
+        )
+
+        tag = "*** CONSISTENT ***" if consistent else "   varies"
+        print(f"0x{sb:02X}  {tag}   [{results_str}]")
+
+    consistent_count = sum(1 for v in verdicts.values() if v["consistent"])
+    print("-" * 60)
+    print(f"Done. {consistent_count}/{len(candidates)} candidates are consistent across {repeats} repeats.")
+
+    return verdicts
+
+
+def parse_candidates_from_sweep_file(path: str) -> list:
+    """
+    Reads a service_byte_sweep output file and extracts the service byte
+    values from lines flagged with '***' (i.e. the "interesting" hits).
+    Returns a sorted list of ints.
+    """
+    candidates = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith("***"):
+                # format: "*** 0xNN  sent=[...]  raw=[...]  ecu_bytes=[...]"
+                parts = line.split()
+                for p in parts:
+                    if p.startswith("0x"):
+                        try:
+                            candidates.append(int(p, 16))
+                        except ValueError:
+                            pass
+                        break
+    return sorted(set(candidates))
+
+
+# ---------------------------------------------------------------------------
+# Differential engine-state capture
+#
+# "Consistent" alone doesn't prove a response is real sensor data -- our
+# software timing is deterministic, so even a fixed protocol artifact
+# reproduces identically every run. The real test is whether the response
+# CHANGES when engine state changes (ignition-only vs idle vs revved).
+# A genuine RPM/throttle/temp byte should move; a fixed ID/constant/artifact
+# will not.
+#
+# Workflow:
+#   1. capture_candidate_snapshot() at state "ignition_on"
+#   2. capture_candidate_snapshot() at state "idle"
+#   3. capture_candidate_snapshot() at state "revved"
+#   4. compare_snapshots() to see which candidates actually moved
+#
+# Results are stored in a JSON file keyed by state name so captures across
+# multiple sessions/weekends can be merged and compared later.
+# ---------------------------------------------------------------------------
+
+def capture_candidate_snapshot(ser: serial.Serial, candidates: list,
+                                table_id: int = 0x11, repeats: int = 3,
+                                delay_between_s: float = 0.15) -> dict:
+    """
+    For each candidate service byte, takes `repeats` readings and keeps the
+    majority/consensus value. Returns {service_byte: [byte, byte, ...] or None}.
+    None means the reading was inconsistent even within this single capture
+    (so not safe to compare across states).
+    """
+    snapshot = {}
+
+    print(f"Capturing snapshot for {len(candidates)} candidates...")
+    for sb in candidates:
+        results = []
+        for _ in range(repeats):
+            try:
+                r = service_byte_probe_one(ser, sb, table_id=table_id)
+                results.append(tuple(r["ecu_bytes"]))
+            except Exception:
+                results.append(None)
+            time.sleep(delay_between_s)
+
+        unique = set(results)
+        if len(unique) == 1 and results[0] not in (None, ()):
+            snapshot[sb] = list(results[0])
+        else:
+            snapshot[sb] = None
+
+        status = "OK" if snapshot[sb] is not None else "inconsistent"
+        val_str = " ".join(f"{b:02X}" for b in snapshot[sb]) if snapshot[sb] else "-"
+        print(f"  0x{sb:02X}: [{val_str}]  ({status})")
+
+    return snapshot
+
+
+def save_snapshot(json_path: str, state_name: str, snapshot: dict) -> None:
+    """
+    Merges a new snapshot into the JSON file under key `state_name`.
+    Existing states are preserved. Service byte keys stored as hex strings
+    for JSON compatibility.
+    """
+    import json
+    import os
+
+    data = {}
+    if os.path.exists(json_path):
+        with open(json_path) as f:
+            try:
+                data = json.load(f)
+            except json.JSONDecodeError:
+                data = {}
+
+    data[state_name] = {
+        f"0x{sb:02X}": val for sb, val in snapshot.items()
+    }
+
+    with open(json_path, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def compare_snapshots(json_path: str) -> None:
+    """
+    Loads all captured states from json_path and prints, for each candidate
+    service byte, whether its value changed across states (likely real data)
+    or stayed identical everywhere (likely a fixed artifact/ID/constant).
+    """
+    import json
+
+    with open(json_path) as f:
+        data = json.load(f)
+
+    states = list(data.keys())
+    if len(states) < 2:
+        print(f"Only {len(states)} state(s) captured so far: {states}")
+        print("Need at least 2 states (e.g. ignition_on, idle) to compare.")
+        return
+
+    print(f"\nComparing {len(states)} states: {states}")
+    print("=" * 70)
+
+    all_keys = set()
+    for state_data in data.values():
+        all_keys.update(state_data.keys())
+
+    changed = []
+    unchanged = []
+    incomplete = []
+
+    for key in sorted(all_keys, key=lambda k: int(k, 16)):
+        values = [data[s].get(key) for s in states]
+
+        if any(v is None for v in values):
+            incomplete.append((key, values))
+            continue
+
+        tuples = [tuple(v) for v in values]
+        if len(set(tuples)) == 1:
+            unchanged.append((key, values))
+        else:
+            changed.append((key, values))
+
+    print(f"\n*** CHANGED across states (likely REAL DATA) — {len(changed)} ***")
+    for key, values in changed:
+        vals_str = " | ".join(" ".join(f"{b:02X}" for b in v) for v in values)
+        print(f"  {key}:  {vals_str}   (states: {', '.join(states)})")
+
+    print(f"\nUnchanged across states (likely fixed ID/constant/artifact) — {len(unchanged)}")
+    for key, values in unchanged:
+        vals_str = " ".join(f"{b:02X}" for b in values[0])
+        print(f"  {key}:  {vals_str}  (same in all states)")
+
+    if incomplete:
+        print(f"\nMissing/inconsistent in some state(s) — {len(incomplete)}")
+        for key, values in incomplete:
+            print(f"  {key}:  {list(zip(states, values))}")
+
+    print("\n" + "=" * 70)
+    if changed:
+        print(f"Focus on the {len(changed)} CHANGED candidate(s) above for building real telemetry.")
+    else:
+        print("No candidates changed across states yet -- capture more states "
+              "(e.g. revved engine) or double check engine state actually differed.")

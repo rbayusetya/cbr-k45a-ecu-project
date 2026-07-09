@@ -1,3 +1,27 @@
+"""
+Honda Keihin K-Line ECU Reader & Prober -- CLI
+
+Rewritten to match the confirmed-protocol ecu_interface.py. The old
+exploratory commands (init-sweep, service-sweep, verify, diff-capture/
+analyze, bruteforce/analyze) depended on functions that were intentionally
+removed -- they were brute-force guessing tools for a protocol we no
+longer need to guess at, now that we have a confirmed reference
+(eculib/honda.py + the Scribd Honda Kline Command Protocol Guide).
+
+Current commands:
+    demo          - simulated data, no hardware needed
+    handshake     - just run the handshake and report the result
+    live          - stream a table continuously (default: confirmed live
+                    data table 0x17)
+    read-table    - one-shot read of a specific table ID
+    read-vin      - one-shot VIN read (table 0x00)
+    probe-known   - check only the 12 confirmed-valid table IDs
+    probe-all     - full 0x00-0xFF sweep (slower, rarely needed now)
+    faults        - read current/past DTCs with human-readable descriptions
+    clear-faults  - clear DTCs (asks for confirmation)
+    sniff         - passive listen, no transmission
+"""
+
 import argparse
 import logging
 import random
@@ -8,12 +32,19 @@ from pathlib import Path
 import yaml
 
 from .ecu_interface import (
+    DTC,
     InitMode,
+    LIVE_DATA_TABLE,
+    VIN_TABLE,
+    clear_faults,
+    get_faults,
     open_connection,
     perform_handshake,
-    sweep_init_modes,
-    query_table,
+    probe_known_tables,
     probe_tables,
+    query_table,
+    read_live_data,
+    read_vin,
 )
 from .parser import parse_parameters
 
@@ -25,7 +56,7 @@ def load_config(path: str = "config.yaml") -> dict:
         return yaml.safe_load(f)
 
 
-def _normalize_table_key(key: str | int) -> int:
+def _normalize_table_key(key) -> int:
     if isinstance(key, str):
         return int(key, 0)
     return key
@@ -39,12 +70,65 @@ def _configure_logging(debug: bool) -> None:
     )
 
 
+def _fmt(data) -> str:
+    if not data:
+        return "(none)"
+    return " ".join(f"{b:02X}" for b in data)
+
+
+def _print_handshake_result(result: dict) -> None:
+    mode = result.get("mode", "?")
+    if result.get("success"):
+        print(f"[{mode}] Handshake OK.")
+    else:
+        print(f"[{mode}] Handshake FAILED -- reason: {result.get('reason')}")
+
+    if "address_prestep_used" in result:
+        print(f"    address_prestep_used: {result.get('address_prestep_used')}")
+        print(f"    address_prestep_recv: {_fmt(result.get('address_prestep_recv'))}")
+    if "ping_recv" in result:
+        print(f"    ping_recv: {_fmt(result.get('ping_recv'))}")
+    if "diag_recv" in result:
+        print(f"    diag_recv: {_fmt(result.get('diag_recv'))}")
+    if "captured" in result:
+        print(f"    captured ({len(result.get('captured') or [])} bytes): {_fmt(result.get('captured'))}")
+
+
+def _open_and_handshake(config: dict, port_override, init_mode: str,
+                         no_prestep: bool = False, skip_wake: bool = False):
+    conn = config.get("connection", {})
+    port = port_override or conn.get("port", "COM3")
+    baud = conn.get("baudrate", 10400)
+    timeout = conn.get("timeout", 1.0)
+
+    print(f"Connecting to {port} at {baud} baud...")
+    ser = open_connection(port, baud, timeout)
+
+    print(f"Performing handshake (mode={init_mode})...")
+    kwargs = {}
+    if InitMode(init_mode) == InitMode.TWO_PHASE:
+        kwargs["do_address_prestep"] = not no_prestep
+        kwargs["skip_wake"] = skip_wake
+
+    result = perform_handshake(ser, mode=InitMode(init_mode), **kwargs)
+    _print_handshake_result(result)
+
+    if not result.get("success"):
+        ser.close()
+        return None
+    return ser
+
+
+# ---------------------------------------------------------------------------
+# demo
+# ---------------------------------------------------------------------------
+
 def run_demo(config: dict) -> None:
     tables = config.get("tables", {})
-    active_key = _normalize_table_key(config.get("active_table", 0x11))
+    active_key = _normalize_table_key(config.get("active_table", LIVE_DATA_TABLE))
     table_cfg = tables.get(active_key, {})
 
-    print(f"Demo Mode — Simulating table 0x{active_key:02X}: {table_cfg.get('name', '')}")
+    print(f"Demo Mode -- Simulating table 0x{active_key:02X}: {table_cfg.get('name', '')}")
     print("-" * 40)
 
     try:
@@ -61,56 +145,33 @@ def run_demo(config: dict) -> None:
         print("\nDemo stopped.")
 
 
-def _print_handshake_result(result: dict) -> None:
-    mode = result.get("mode", "?")
-    if result.get("success"):
-        print(f"[{mode}] Handshake OK.")
-    else:
-        print(f"[{mode}] Handshake FAILED — reason: {result.get('reason')}")
-    if "sent" in result:
-        print(f"    sent:     {_fmt(result.get('sent'))}")
-        print(f"    received: {_fmt(result.get('received'))}")
-    if "key_bytes" in result:
-        print(f"    sync_byte: {_fmt_byte(result.get('sync_byte'))}")
-        print(f"    key_bytes: {_fmt(result.get('key_bytes'))}")
-        print(f"    echo_response: {_fmt_byte(result.get('echo_response'))}")
-    if "captured" in result:
-        print(f"    captured ({len(result.get('captured') or [])} bytes): {_fmt(result.get('captured'))}")
+# ---------------------------------------------------------------------------
+# handshake
+# ---------------------------------------------------------------------------
+
+def run_handshake(config: dict, port_override, init_mode: str, no_prestep: bool, skip_wake: bool) -> None:
+    ser = _open_and_handshake(config, port_override, init_mode, no_prestep, skip_wake)
+    if ser:
+        ser.close()
 
 
-def _fmt(data) -> str:
-    if not data:
-        return "(none)"
-    return " ".join(f"{b:02X}" for b in data)
+# ---------------------------------------------------------------------------
+# live
+# ---------------------------------------------------------------------------
 
-
-def _fmt_byte(b) -> str:
-    return f"0x{b:02X}" if b is not None else "(none)"
-
-
-def run_live(config: dict, port_override: str | None, table_override: str | None, init_mode: str) -> None:
-    conn = config.get("connection", {})
-    port = port_override or conn.get("port", "COM3")
-    baud = conn.get("baudrate", 10400)
-    timeout = conn.get("timeout", 1.0)
-
+def run_live(config: dict, port_override, table_override, init_mode: str,
+             no_prestep: bool, skip_wake: bool) -> None:
     tables = config.get("tables", {})
-    active_cfg = table_override or config.get("active_table", 0x11)
+    active_cfg = table_override or config.get("active_table", LIVE_DATA_TABLE)
     table_key = _normalize_table_key(active_cfg)
     table_cfg = tables.get(table_key, {})
 
     if not table_cfg:
-        print(f"Error: table 0x{table_key:02X} not found in config", file=sys.stderr)
-        sys.exit(1)
+        print(f"Warning: table 0x{table_key:02X} has no config entry -- "
+              f"will print raw bytes instead of parsed values", file=sys.stderr)
 
-    print(f"Connecting to {port} at {baud} baud...")
-    ser = open_connection(port, baud, timeout)
-
-    print(f"Performing handshake (mode={init_mode})...")
-    result = perform_handshake(ser, mode=InitMode(init_mode))
-    _print_handshake_result(result)
-    if not result.get("success"):
-        ser.close()
+    ser = _open_and_handshake(config, port_override, init_mode, no_prestep, skip_wake)
+    if not ser:
         sys.exit(1)
 
     print(f"Streaming table 0x{table_key:02X}: {table_cfg.get('name', '')}")
@@ -120,11 +181,13 @@ def run_live(config: dict, port_override: str | None, table_override: str | None
         while True:
             resp = query_table(ser, table_key)
             if resp is None:
-                print("No response / checksum error")
-            else:
+                print("No response / invalid table / checksum error")
+            elif table_cfg:
                 results = parse_parameters(bytes(resp), table_cfg)
                 for name, info in results.items():
                     print(f"  {name}: {info['value']:.2f} {info['unit']}")
+            else:
+                print(f"  raw: {_fmt(resp)}")
             print("-" * 40)
             time.sleep(0.5)
     except KeyboardInterrupt:
@@ -133,30 +196,77 @@ def run_live(config: dict, port_override: str | None, table_override: str | None
         ser.close()
 
 
-def run_probe(config: dict, port_override: str | None, init_mode: str, output_file: str = "probe_results.txt") -> None:
-    conn = config.get("connection", {})
-    port = port_override or conn.get("port", "COM3")
-    baud = conn.get("baudrate", 10400)
-    timeout = conn.get("timeout", 1.0)
+# ---------------------------------------------------------------------------
+# read-table / read-vin
+# ---------------------------------------------------------------------------
 
-    print(f"Connecting to {port} at {baud} baud...")
-    ser = open_connection(port, baud, timeout)
+def run_read_table(config: dict, port_override, init_mode: str,
+                    table_id_str: str, no_prestep: bool, skip_wake: bool) -> None:
+    table_id = int(table_id_str, 0)
 
-    print(f"Performing handshake (mode={init_mode})...")
-    result = perform_handshake(ser, mode=InitMode(init_mode))
-    _print_handshake_result(result)
-    if not result.get("success"):
-        ser.close()
+    ser = _open_and_handshake(config, port_override, init_mode, no_prestep, skip_wake)
+    if not ser:
         sys.exit(1)
 
-    print(f"Handshake OK. Probing table IDs 0x00-0xFF...")
+    resp = query_table(ser, table_id)
+    if resp is None:
+        print(f"Table 0x{table_id:02X}: no response / invalid / unsupported")
+    else:
+        print(f"Table 0x{table_id:02X}: {_fmt(resp)}")
+
+    ser.close()
+
+
+def run_read_vin(config: dict, port_override, init_mode: str, no_prestep: bool, skip_wake: bool) -> None:
+    ser = _open_and_handshake(config, port_override, init_mode, no_prestep, skip_wake)
+    if not ser:
+        sys.exit(1)
+
+    resp = read_vin(ser)
+    if resp is None:
+        print("VIN: no response")
+    else:
+        print(f"VIN raw bytes: {_fmt(resp)}")
+
+    ser.close()
+
+
+# ---------------------------------------------------------------------------
+# probe-known / probe-all
+# ---------------------------------------------------------------------------
+
+def run_probe_known(config: dict, port_override, init_mode: str, no_prestep: bool, skip_wake: bool) -> None:
+    ser = _open_and_handshake(config, port_override, init_mode, no_prestep, skip_wake)
+    if not ser:
+        sys.exit(1)
+
+    print("Checking confirmed-valid table list...")
+    print("-" * 40)
+    results = probe_known_tables(ser)
+    for table_id, info in results.items():
+        status = info["status"]
+        if status == "ACTIVE":
+            print(f"  0x{table_id:02X}  ACTIVE  len={info['length']}  bytes={_fmt(info['raw_bytes'])}")
+        else:
+            print(f"  0x{table_id:02X}  {status}")
+
+    ser.close()
+
+
+def run_probe_all(config: dict, port_override, init_mode: str,
+                   output_file: str, no_prestep: bool, skip_wake: bool) -> None:
+    ser = _open_and_handshake(config, port_override, init_mode, no_prestep, skip_wake)
+    if not ser:
+        sys.exit(1)
+
+    print("Probing full table ID range 0x00-0xFF...")
     print(f"Results written incrementally to: {output_file}")
     print("-" * 40)
 
     active_count = 0
-
     with open(output_file, "a") as f:
-        f.write(f"\n=== Probe session {__import__('datetime').datetime.now().isoformat()} ===\n")
+        import datetime
+        f.write(f"\n=== Probe session {datetime.datetime.now().isoformat()} ===\n")
         f.flush()
 
         for table_id in range(0x00, 0x100):
@@ -165,16 +275,14 @@ def run_probe(config: dict, port_override: str | None, init_mode: str, output_fi
                 resp = query_table(ser, table_id)
                 if resp is not None:
                     active_count += 1
-                    hex_str = " ".join(f"{b:02X}" for b in resp)
-                    line = f"ACTIVE  0x{table_id:02X}  len={len(resp)}  bytes={hex_str}"
+                    line = f"ACTIVE  0x{table_id:02X}  len={len(resp)}  bytes={_fmt(resp)}"
                     print(f"\n  *** {line}")
                     f.write(line + "\n")
-                    f.flush()
                 else:
-                    f.write(f"SILENT  0x{table_id:02X}\n")
-                    f.flush()
+                    f.write(f"INACTIVE  0x{table_id:02X}\n")
+                f.flush()
             except Exception as exc:
-                line = f"ERROR   0x{table_id:02X}  {exc}"
+                line = f"ERROR  0x{table_id:02X}  {exc}"
                 f.write(line + "\n")
                 f.flush()
 
@@ -185,23 +293,49 @@ def run_probe(config: dict, port_override: str | None, init_mode: str, output_fi
     ser.close()
 
 
-def run_init_sweep(config: dict, port_override: str | None) -> None:
-    """Tries every known init mode in turn and reports which one (if any) gets a response."""
-    conn = config.get("connection", {})
-    port = port_override or conn.get("port", "COM3")
-    baud = conn.get("baudrate", 10400)
-    timeout = conn.get("timeout", 1.0)
+# ---------------------------------------------------------------------------
+# faults / clear-faults
+# ---------------------------------------------------------------------------
 
-    print(f"Sweeping all init modes against {port} at {baud} baud...")
-    print("-" * 40)
-    results = sweep_init_modes(port, baud, timeout)
-    for mode_name, result in results.items():
-        _print_handshake_result(result)
-        print("-" * 40)
+def run_faults(config: dict, port_override, init_mode: str, no_prestep: bool, skip_wake: bool) -> None:
+    ser = _open_and_handshake(config, port_override, init_mode, no_prestep, skip_wake)
+    if not ser:
+        sys.exit(1)
+
+    print("Reading fault codes...")
+    faults = get_faults(ser)
+    ser.close()
+
+    for kind in ("current", "past"):
+        codes = faults.get(kind, [])
+        print(f"\n{kind.upper()} faults: {len(codes)}")
+        for code in codes:
+            desc = DTC.get(code, "Unknown code")
+            print(f"  {code}: {desc}")
 
 
-def run_sniff(config: dict, port_override: str | None, duration: float) -> None:
-    """Passive listen mode — no init sequence sent at all."""
+def run_clear_faults(config: dict, port_override, init_mode: str, no_prestep: bool,
+                      yes: bool, skip_wake: bool = False) -> None:
+    if not yes:
+        confirm = input("This will clear all stored DTCs. Type 'yes' to continue: ")
+        if confirm.strip().lower() != "yes":
+            print("Cancelled.")
+            return
+
+    ser = _open_and_handshake(config, port_override, init_mode, no_prestep, skip_wake)
+    if not ser:
+        sys.exit(1)
+
+    ok = clear_faults(ser)
+    ser.close()
+    print("Faults cleared." if ok else "Clear faults: no response / failed")
+
+
+# ---------------------------------------------------------------------------
+# sniff
+# ---------------------------------------------------------------------------
+
+def run_sniff(config: dict, port_override, duration: float) -> None:
     conn = config.get("connection", {})
     port = port_override or conn.get("port", "COM3")
     baud = conn.get("baudrate", 10400)
@@ -214,124 +348,9 @@ def run_sniff(config: dict, port_override: str | None, duration: float) -> None:
     _print_handshake_result(result)
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Honda Keihin K-Line ECU Reader & Prober"
-    )
-
-    # ---- subcommands ----
-    sub = parser.add_subparsers(dest="command")
-
-    # demo
-    sub.add_parser("demo", help="Simulated data, no hardware needed")
-
-    # live
-    p_live = sub.add_parser("live", help="Live stream from physical ECU")
-    p_live.add_argument("--table", help="Table ID override (e.g. 0x11)")
-    p_live.add_argument("--init-mode", choices=[m.value for m in InitMode if m != InitMode.PASSIVE_SNIFF],
-                        default=InitMode.FAST_KEIHIN.value)
-
-    # probe
-    p_probe = sub.add_parser("probe", help="Fuzz all table IDs after handshake")
-    p_probe.add_argument("--init-mode", choices=[m.value for m in InitMode if m != InitMode.PASSIVE_SNIFF],
-                         default=InitMode.FAST_KEIHIN.value)
-
-    # init-sweep
-    sub.add_parser("init-sweep", help="Try every known init mode and report")
-
-    # sniff
-    p_sniff = sub.add_parser("sniff", help="Passive listen, no init sent")
-    p_sniff.add_argument("--duration", type=float, default=10.0, help="Seconds to listen")
-
-    # bruteforce  <-- new
-    p_bf = sub.add_parser("bruteforce", help="Sweep all init parameter combinations brute-force")
-    p_bf.add_argument("--output", dest="bf_output", default="bruteforce_results.jsonl",
-                      help="JSONL file to write results to (appended incrementally)")
-    p_bf.add_argument("--baud", dest="bf_baud", default=None,
-                      help="Comma-separated baud rates to try (default: 10400,9600,19200)")
-    p_bf.add_argument("--low", dest="bf_low", default=None,
-                      help="Comma-separated break-low durations ms (default: 25,50,70,100,200,300)")
-    p_bf.add_argument("--high", dest="bf_high", default=None,
-                      help="Comma-separated break-high durations ms (default: 25,50,100,120,200)")
-    p_bf.add_argument("--delay", dest="bf_delay", default=None,
-                      help="Comma-separated post-break delays ms (default: 0,10,25,50,100)")
-    p_bf.add_argument("--interval", dest="bf_interval", type=float, default=0.3,
-                      help="Seconds between attempts (default: 0.3)")
-    p_bf.add_argument("--dry-run", dest="bf_dry_run", action="store_true",
-                      help="List all combinations without sending anything")
-
-    # analyze  <-- new: offline re-analysis of a previous run's JSONL
-    p_an = sub.add_parser("analyze", help="Re-analyze a previous bruteforce JSONL result file")
-    p_an.add_argument("--output", dest="bf_output", default="bruteforce_results.jsonl",
-                      help="JSONL file to read")
-    p_an.add_argument("--top", dest="bf_top", type=int, default=20,
-                      help="Show top N results (default: 20)")
-
-    # ---- global flags ----
-    parser.add_argument("--port", help="Serial port (e.g. /dev/ttyUSB0)")
-    parser.add_argument("--config", default=str(Path(__file__).parent / "config.yaml"))
-    parser.add_argument("--debug", action="store_true",
-                        help="Log raw TX/RX bytes (strongly recommended during RE)")
-
-    args = parser.parse_args()
-    _configure_logging(args.debug)
-
-    if args.command in (None, "demo"):
-        config = load_config(args.config)
-        run_demo(config)
-        return
-
-    if args.command == "bruteforce":
-        run_bruteforce_cmd(args)
-        return
-
-    if args.command == "analyze":
-        run_analyze_cmd(args)
-        return
-
-    config = load_config(args.config)
-
-    if args.command == "live":
-        run_live(config, args.port, getattr(args, "table", None), args.init_mode)
-    elif args.command == "probe":
-        run_probe(config, args.port, args.init_mode)
-    elif args.command == "init-sweep":
-        run_init_sweep(config, args.port)
-    elif args.command == "sniff":
-        run_sniff(config, args.port, args.duration)
-    else:
-        parser.print_help()
-
-
-def run_bruteforce_cmd(args) -> None:
-    from .bruteforce import (
-        load_results, print_summary, run_bruteforce,
-    )
-    from pathlib import Path
-
-    output = Path(args.bf_output)
-    results = run_bruteforce(
-        port=args.port or "COM3",
-        output_path=output,
-        baud_list=[int(x) for x in args.bf_baud.split(",")] if args.bf_baud else None,
-        break_low_list=[int(x) for x in args.bf_low.split(",")] if args.bf_low else None,
-        break_high_list=[int(x) for x in args.bf_high.split(",")] if args.bf_high else None,
-        post_break_list=[int(x) for x in args.bf_delay.split(",")] if args.bf_delay else None,
-        delay_between_s=args.bf_interval,
-        dry_run=args.bf_dry_run,
-    )
-    if results:
-        print_summary(results)
-    print(f"\nFull results saved to: {output}")
-
-
-def run_analyze_cmd(args) -> None:
-    from .bruteforce import load_results, print_summary
-    from pathlib import Path
-
-    results = load_results(Path(args.bf_output))
-    print_summary(results, top_n=args.bf_top)
-
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -342,38 +361,68 @@ def main() -> None:
 
     sub.add_parser("demo", help="Simulated data, no hardware needed")
 
-    p_live = sub.add_parser("live", help="Live stream from physical ECU")
-    p_live.add_argument("--table", help="Table ID override (e.g. 0x11)")
+    p_hs = sub.add_parser("handshake", help="Run the handshake and report the result")
+    p_hs.add_argument("--init-mode", choices=[m.value for m in InitMode if m != InitMode.PASSIVE_SNIFF],
+                      default=InitMode.TWO_PHASE.value)
+    p_hs.add_argument("--no-prestep", action="store_true",
+                      help="Skip the empirical 0x33/0x31 address pre-step "
+                           "(test whether it's actually still necessary)")
+    p_hs.add_argument("--skip-wake", action="store_true",
+                      help="Skip the unresponsive FE 04 72 8C wake packet, go straight to diag()")
+
+    p_live = sub.add_parser("live", help="Stream a table continuously")
+    p_live.add_argument("--table", help="Table ID override (default: confirmed live data table 0x17)")
     p_live.add_argument("--init-mode", choices=[m.value for m in InitMode if m != InitMode.PASSIVE_SNIFF],
-                        default=InitMode.FAST_KEIHIN.value)
+                        default=InitMode.TWO_PHASE.value)
+    p_live.add_argument("--no-prestep", action="store_true")
+    p_live.add_argument("--skip-wake", action="store_true")
 
-    p_probe = sub.add_parser("probe", help="Fuzz all table IDs after handshake")
-    p_probe.add_argument("--init-mode", choices=[m.value for m in InitMode if m != InitMode.PASSIVE_SNIFF],
-                         default=InitMode.FAST_KEIHIN.value)
-    p_probe.add_argument("--output", default="probe_results.txt",
-                         help="File to write results to incrementally")
+    p_rt = sub.add_parser("read-table", help="One-shot read of a specific table ID")
+    p_rt.add_argument("table_id", help="Table ID, e.g. 0x17")
+    p_rt.add_argument("--init-mode", choices=[m.value for m in InitMode if m != InitMode.PASSIVE_SNIFF],
+                      default=InitMode.TWO_PHASE.value)
+    p_rt.add_argument("--no-prestep", action="store_true")
+    p_rt.add_argument("--skip-wake", action="store_true")
 
-    sub.add_parser("init-sweep", help="Try every known init mode and report")
+    p_vin = sub.add_parser("read-vin", help="One-shot VIN read (table 0x00)")
+    p_vin.add_argument("--init-mode", choices=[m.value for m in InitMode if m != InitMode.PASSIVE_SNIFF],
+                       default=InitMode.TWO_PHASE.value)
+    p_vin.add_argument("--no-prestep", action="store_true")
+    p_vin.add_argument("--skip-wake", action="store_true")
+
+    p_pk = sub.add_parser("probe-known", help="Check only the 12 confirmed-valid table IDs")
+    p_pk.add_argument("--init-mode", choices=[m.value for m in InitMode if m != InitMode.PASSIVE_SNIFF],
+                      default=InitMode.TWO_PHASE.value)
+    p_pk.add_argument("--no-prestep", action="store_true")
+    p_pk.add_argument("--skip-wake", action="store_true")
+
+    p_pa = sub.add_parser("probe-all", help="Full 0x00-0xFF table sweep")
+    p_pa.add_argument("--init-mode", choices=[m.value for m in InitMode if m != InitMode.PASSIVE_SNIFF],
+                      default=InitMode.TWO_PHASE.value)
+    p_pa.add_argument("--output", default="probe_results.txt")
+    p_pa.add_argument("--no-prestep", action="store_true")
+    p_pa.add_argument("--skip-wake", action="store_true")
+
+    p_faults = sub.add_parser("faults", help="Read current/past DTCs")
+    p_faults.add_argument("--init-mode", choices=[m.value for m in InitMode if m != InitMode.PASSIVE_SNIFF],
+                          default=InitMode.TWO_PHASE.value)
+    p_faults.add_argument("--no-prestep", action="store_true")
+    p_faults.add_argument("--skip-wake", action="store_true")
+
+    p_clear = sub.add_parser("clear-faults", help="Clear DTCs (asks for confirmation)")
+    p_clear.add_argument("--init-mode", choices=[m.value for m in InitMode if m != InitMode.PASSIVE_SNIFF],
+                         default=InitMode.TWO_PHASE.value)
+    p_clear.add_argument("--no-prestep", action="store_true")
+    p_clear.add_argument("--skip-wake", action="store_true")
+    p_clear.add_argument("--yes", action="store_true", help="Skip confirmation prompt")
 
     p_sniff = sub.add_parser("sniff", help="Passive listen, no init sent")
     p_sniff.add_argument("--duration", type=float, default=10.0)
 
-    p_bf = sub.add_parser("bruteforce", help="Sweep all init parameter combinations")
-    p_bf.add_argument("--output", dest="bf_output", default="bruteforce_results.jsonl")
-    p_bf.add_argument("--baud", dest="bf_baud", default=None)
-    p_bf.add_argument("--low", dest="bf_low", default=None)
-    p_bf.add_argument("--high", dest="bf_high", default=None)
-    p_bf.add_argument("--delay", dest="bf_delay", default=None)
-    p_bf.add_argument("--interval", dest="bf_interval", type=float, default=0.3)
-    p_bf.add_argument("--dry-run", dest="bf_dry_run", action="store_true")
-
-    p_an = sub.add_parser("analyze", help="Re-analyze a previous bruteforce JSONL file")
-    p_an.add_argument("--output", dest="bf_output", default="bruteforce_results.jsonl")
-    p_an.add_argument("--top", dest="bf_top", type=int, default=20)
-
     parser.add_argument("--port", help="Serial port (e.g. /dev/ttyUSB0)")
     parser.add_argument("--config", default=str(Path(__file__).parent / "config.yaml"))
-    parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--debug", action="store_true",
+                        help="Log raw TX/RX bytes (recommended)")
 
     args = parser.parse_args()
     _configure_logging(args.debug)
@@ -383,22 +432,24 @@ def main() -> None:
         run_demo(config)
         return
 
-    if args.command == "bruteforce":
-        run_bruteforce_cmd(args)
-        return
-
-    if args.command == "analyze":
-        run_analyze_cmd(args)
-        return
-
     config = load_config(args.config)
 
-    if args.command == "live":
-        run_live(config, args.port, getattr(args, "table", None), args.init_mode)
-    elif args.command == "probe":
-        run_probe(config, args.port, args.init_mode, args.output)
-    elif args.command == "init-sweep":
-        run_init_sweep(config, args.port)
+    if args.command == "handshake":
+        run_handshake(config, args.port, args.init_mode, args.no_prestep, args.skip_wake)
+    elif args.command == "live":
+        run_live(config, args.port, args.table, args.init_mode, args.no_prestep, args.skip_wake)
+    elif args.command == "read-table":
+        run_read_table(config, args.port, args.init_mode, args.table_id, args.no_prestep, args.skip_wake)
+    elif args.command == "read-vin":
+        run_read_vin(config, args.port, args.init_mode, args.no_prestep, args.skip_wake)
+    elif args.command == "probe-known":
+        run_probe_known(config, args.port, args.init_mode, args.no_prestep, args.skip_wake)
+    elif args.command == "probe-all":
+        run_probe_all(config, args.port, args.init_mode, args.output, args.no_prestep, args.skip_wake)
+    elif args.command == "faults":
+        run_faults(config, args.port, args.init_mode, args.no_prestep, args.skip_wake)
+    elif args.command == "clear-faults":
+        run_clear_faults(config, args.port, args.init_mode, args.no_prestep, args.yes, args.skip_wake)
     elif args.command == "sniff":
         run_sniff(config, args.port, args.duration)
     else:
