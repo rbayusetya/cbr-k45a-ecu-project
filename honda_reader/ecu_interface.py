@@ -119,38 +119,19 @@ class InitMode(str, Enum):
 # ---------------------------------------------------------------------------
 
 def checksum(data: list) -> int:
-    """
-    Standard Keihin two's-complement checksum.
-    Mathematically identical to eculib's checksum8bitHonda():
-        ((sum(data) ^ 0xFF) + 1) & 0xFF  ==  (0x100 - (sum(data) & 0xFF)) & 0xFF
-    """
     return (0x100 - (sum(data) & 0xFF)) & 0xFF
 
-
 def message_is_valid(full_message: list) -> bool:
-    """
-    A complete message (including its own trailing checksum byte) is valid
-    if the checksum of the WHOLE thing comes out to 0 -- this is the
-    standard two's-complement checksum invariant, confirmed against
-    eculib's `checksum8bitHonda(byts) == 0` validation.
-    """
     return checksum(full_message) == 0
 
-
 def format_message(mtype: list, data: list) -> list:
-    """
-    Builds a complete message: mtype + [length] + data + [checksum].
-    Ported directly from eculib.honda.format_message(). The length byte
-    equals the TOTAL message length (header + length byte + data + checksum),
-    confirmed against every captured example we have.
-    """
+    """Builds a complete message: mtype + [length] + data + [checksum]."""
     ml = len(mtype)
     dl = len(data)
     msgsize = 2 + ml + dl
     msg = mtype + [msgsize] + data
     msg = msg + [checksum(msg)]
     return msg
-
 
 # ---------------------------------------------------------------------------
 # Raw-byte logging helpers
@@ -216,21 +197,8 @@ def _read_exact(ser: serial.Serial, n: int, deadline: float):
 # ---------------------------------------------------------------------------
 
 def send_and_receive(ser: serial.Serial, mtype: list, data: list,
-                      timeout: float = 2.0, label: str = "",
-                      inter_byte_delay_ms: float = 0.0) -> list | None:
-    """
-    Sends a message built from mtype+data, and returns the ECU's response
-    data payload (list of ints), or None on timeout/invalid response.
-
-    inter_byte_delay_ms: if > 0, bytes are written one at a time with this
-    delay between them, instead of one bulk write. This exists to test
-    whether this ECU expects turnaround time between bytes that a real
-    tool's FTDI bitbang-mode writes might provide incidentally (bitbang
-    writes have natural per-byte USB latency baked in, unlike a plain
-    burst write). Corruption that only appears after this ECU is awake
-    (post pre-step) but never cold or after a plain break could be
-    explained by our burst write being tighter than this firmware expects.
-    """
+                     timeout: float = 2.0, label: str = "",
+                     inter_byte_delay_ms: float = 0.0) -> list | None:
     msg = format_message(mtype, data)
     ml = len(mtype)
     label = label or f"cmd_0x{mtype[0]:02X}"
@@ -248,7 +216,7 @@ def send_and_receive(ser: serial.Serial, mtype: list, data: list,
 
     deadline = time.time() + timeout
 
-    # Phase 1: drain our own TX echo, as one complete distinct read.
+    # Phase 1: drain our own TX echo
     echo = _read_exact(ser, len(msg), deadline)
     if echo is None:
         logger.debug("%s: no echo received (timeout)", label)
@@ -294,12 +262,21 @@ def send_and_receive(ser: serial.Serial, mtype: list, data: list,
 # ---------------------------------------------------------------------------
 
 def _break_pulse(ser: serial.Serial, low_ms: float, high_ms: float) -> None:
-    ser.break_condition = True
-    time.sleep(low_ms / 1000.0)
-    ser.break_condition = False
-    time.sleep(high_ms / 1000.0)
+    # Bulletproof K-Line low pulse: spam 0x00 bytes to hold the line low.
+    baud = ser.baudrate
+    byte_time_ms = (10.0 / baud) * 1000.0  # 10 bits per byte
+    num_bytes = int(low_ms / byte_time_ms)
+
+    ser.write(b'\x00' * num_bytes)
+    # Give the adapter a moment to flush the TX buffer
+    time.sleep(0.05)
+
+    # Clear the RX buffer (the ECU might echo the 0x00s or glitch)
     ser.reset_input_buffer()
     ser.reset_output_buffer()
+
+    # Wait for the high/idle time
+    time.sleep(high_ms / 1000.0)
 
 
 # ---------------------------------------------------------------------------
@@ -535,7 +512,8 @@ def two_phase_handshake(ser: serial.Serial, do_address_prestep: bool = True,
             return result
 
         # Drain any trailing bytes before moving on.
-        ser.timeout = 0.2
+        # NOTE: Do NOT use a 200ms timeout here! It will drop the K-line session.
+        ser.timeout = 0.01  # MUST BE 10ms, NOT 200ms!
         while ser.read(1):
             pass
         ser.timeout = 1.0
@@ -565,6 +543,8 @@ def two_phase_handshake(ser: serial.Serial, do_address_prestep: bool = True,
         result["reason"] = "handshake_partial_skip_diag"
         return result
 
+    # Inside two_phase_handshake, replace the old diag_resp line with:
+    # Honda diag session command is 0x00, 0xF0. Sender MUST be 0x02.
     diag_resp = send_and_receive(ser, [0x72], [0x00, 0xF0], label="diag")
     result["diag_recv"] = diag_resp
     if diag_resp is None:
@@ -609,12 +589,6 @@ def perform_handshake(ser: serial.Serial, mode: InitMode = InitMode.TWO_PHASE,
 # ---------------------------------------------------------------------------
 
 def query_table(ser: serial.Serial, table_id: int) -> list | None:
-    """
-    Reads a data table. Confirmed format: mtype=[0x72], data=[0x71, table_id].
-    Returns the response payload (which includes an echo of [0x71, table_id,
-    <request_checksum>] as its first 3 bytes, followed by the actual table
-    data), or None if the table is invalid/unsupported or the read failed.
-    """
     return send_and_receive(ser, [0x72], [0x71, table_id],
                              label=f"read_table_0x{table_id:02X}")
 
