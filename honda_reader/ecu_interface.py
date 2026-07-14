@@ -216,10 +216,20 @@ def _read_exact(ser: serial.Serial, n: int, deadline: float):
 # ---------------------------------------------------------------------------
 
 def send_and_receive(ser: serial.Serial, mtype: list, data: list,
-                      timeout: float = 2.0, label: str = "") -> list | None:
+                      timeout: float = 2.0, label: str = "",
+                      inter_byte_delay_ms: float = 0.0) -> list | None:
     """
     Sends a message built from mtype+data, and returns the ECU's response
     data payload (list of ints), or None on timeout/invalid response.
+
+    inter_byte_delay_ms: if > 0, bytes are written one at a time with this
+    delay between them, instead of one bulk write. This exists to test
+    whether this ECU expects turnaround time between bytes that a real
+    tool's FTDI bitbang-mode writes might provide incidentally (bitbang
+    writes have natural per-byte USB latency baked in, unlike a plain
+    burst write). Corruption that only appears after this ECU is awake
+    (post pre-step) but never cold or after a plain break could be
+    explained by our burst write being tighter than this firmware expects.
     """
     msg = format_message(mtype, data)
     ml = len(mtype)
@@ -229,7 +239,12 @@ def send_and_receive(ser: serial.Serial, mtype: list, data: list,
     ser.reset_output_buffer()
 
     _log_tx(label, msg)
-    ser.write(bytearray(msg))
+    if inter_byte_delay_ms > 0:
+        for b in msg:
+            ser.write(bytes([b]))
+            time.sleep(inter_byte_delay_ms / 1000.0)
+    else:
+        ser.write(bytearray(msg))
 
     deadline = time.time() + timeout
 
@@ -288,6 +303,158 @@ def _break_pulse(ser: serial.Serial, low_ms: float, high_ms: float) -> None:
 
 
 # ---------------------------------------------------------------------------
+# ISO9141-2 5-baud init -- NEW, separate experimental path
+#
+# Our confirmed working "address pre-step" (send 0x33 as a normal fast
+# UART byte after a 25ms break, get 0x31 back) is NOT the same mechanism
+# as a real 5-baud init, despite sharing the 0x33 byte value by
+# coincidence. A genuine 5-baud init means bit-banging the address byte
+# at 200ms per bit (~1.8 seconds total) -- a completely different
+# physical event on the wire. We built this once before, but only ever
+# tested it with address 0x10 (a common generic default), never 0x33
+# specifically, and never with correct inter-byte timing on the
+# handshake response. This is a from-scratch, careful rebuild.
+#
+# Sequence (per ISO9141-2, cross-checked against a separate independent
+# description of the same spec):
+#   1. Bit-bang the address byte (0x33) at 5 baud (200ms/bit): start bit
+#      (low), 8 data bits LSB-first, stop bit (high).
+#   2. Immediately switch the UART to 10400 baud.
+#   3. Wait up to 50ms, then read whatever the ECU sends. Expected: 4
+#      bytes -- keyword byte 1 (KB1), keyword byte 2 (KB2), then their
+#      bitwise complements (~KB1, ~KB2) sent by the ECU itself. (This
+#      differs from the textbook single sync-byte-then-2-keywords
+#      description -- built to match what was actually observed/reported
+#      for this specific implementation, not assumed from a textbook.)
+#   4. Send byte 3 (~KB1) back to the ECU, wait 5ms, then send byte 4
+#      (~KB2) back. This appears to be an echo-style acknowledgment
+#      rather than the classic "compute and send ~KB2 only" W4 step --
+#      again, built from the specific description we have for this ECU
+#      rather than the general ISO9141-2 textbook procedure.
+#   5. From here, the confirmed 0x72-prefixed Keihin message layer
+#      (send_and_receive, query_table, etc.) should be usable.
+#
+# Timing matters: too fast between steps has been reported to fail, so
+# explicit delays are used rather than firing everything back-to-back.
+# ---------------------------------------------------------------------------
+
+def _send_bit_banged_byte(ser: serial.Serial, byte_val: int, bit_ms: float = 200.0) -> None:
+    """
+    Bit-bangs a single byte onto K-Line at 5 baud (200ms/bit) using the
+    break_condition line as a manual low/high driver:
+      - start bit: low
+      - 8 data bits, LSB first: low=0, high=1
+      - stop bit: high
+    """
+    bits = [0]
+    bits += [(byte_val >> i) & 1 for i in range(8)]
+    bits += [1]
+
+    for bit in bits:
+        ser.break_condition = (bit == 0)
+        time.sleep(bit_ms / 1000.0)
+    ser.break_condition = False
+
+
+def iso_5baud_handshake(ser: serial.Serial, port: str, baudrate: int, timeout: float,
+                         address: int = 0x33,
+                         keyword_wait_s: float = 0.05,
+                         interbyte_delay_s: float = 0.005) -> dict:
+    """
+    Performs the full 4-phase ISO9141-2 5-baud init described above.
+    Returns a diagnostic dict with everything observed at each phase --
+    this is written for exploration, not to silently hide partial
+    failures, since we don't yet know for certain this sequence is
+    correct for this specific ECU either.
+
+    NOTE: this reopens the serial port at a different baud partway
+    through (5-baud bit-banging happens at whatever baud the port is
+    already at via break_condition toggling, which is baud-independent;
+    but we still need port/baudrate/timeout to correctly REOPEN at
+    10400 for the keyword exchange phase).
+    """
+    result = {
+        "mode": "iso_5baud",
+        "address_sent": address,
+        "keyword_bytes_captured": [],
+        "sent_byte3": None,
+        "sent_byte4": None,
+        "success": False,
+        "reason": None,
+    }
+
+    # --- Phase 1: bit-bang the address byte at true 5 baud ---
+    logger.debug("ISO 5-baud Phase 1: bit-banging address 0x%02X at 200ms/bit "
+                 "(this takes ~1.8s)", address)
+    _send_bit_banged_byte(ser, address, bit_ms=200.0)
+
+    # --- Phase 2: switch to 10400 baud immediately ---
+    logger.debug("ISO 5-baud Phase 2: switching to %d baud", baudrate)
+    ser.baudrate = baudrate
+    ser.reset_input_buffer()
+    ser.reset_output_buffer()
+
+    # --- Phase 3: wait up to 50ms, capture whatever the ECU sends ---
+    logger.debug("ISO 5-baud Phase 3: listening up to %.0fms for keyword bytes",
+                 keyword_wait_s * 1000)
+    captured = []
+    start = time.time()
+    deadline = start + keyword_wait_s
+    while time.time() < deadline:
+        chunk = ser.read(1)
+        if chunk:
+            elapsed_ms = (time.time() - start) * 1000.0
+            captured.append((chunk[0], elapsed_ms))
+
+    result["keyword_bytes_captured"] = captured
+    formatted = " ".join(f"{b:02X}@{t:.2f}ms" for b, t in captured) if captured else "(none)"
+    logger.debug("ISO 5-baud Phase 3 result: %s", formatted)
+
+    if len(captured) < 4:
+        result["reason"] = f"expected_4_keyword_bytes_got_{len(captured)}"
+        return result
+
+    kb1, kb2, inv_kb1, inv_kb2 = (captured[0][0], captured[1][0],
+                                   captured[2][0], captured[3][0])
+
+    # Sanity-check the complement relationship, but log rather than hard-fail --
+    # we want to see what's really happening even if it doesn't match exactly.
+    if inv_kb1 != ((~kb1) & 0xFF):
+        logger.debug("ISO 5-baud: byte3 (0x%02X) is NOT the bitwise complement "
+                     "of byte1 (0x%02X) -- expected 0x%02X",
+                     inv_kb1, kb1, (~kb1) & 0xFF)
+    if inv_kb2 != ((~kb2) & 0xFF):
+        logger.debug("ISO 5-baud: byte4 (0x%02X) is NOT the bitwise complement "
+                     "of byte2 (0x%02X) -- expected 0x%02X",
+                     inv_kb2, kb2, (~kb2) & 0xFF)
+
+    result["kb1"] = kb1
+    result["kb2"] = kb2
+    result["inv_kb1"] = inv_kb1
+    result["inv_kb2"] = inv_kb2
+
+    # --- Phase 4: echo byte3, wait 5ms, echo byte4 ---
+    logger.debug("ISO 5-baud Phase 4: sending byte3 (0x%02X)", inv_kb1)
+    ser.write(bytes([inv_kb1]))
+    result["sent_byte3"] = inv_kb1
+
+    time.sleep(interbyte_delay_s)
+
+    logger.debug("ISO 5-baud Phase 4: sending byte4 (0x%02X) after %.0fms delay",
+                 inv_kb2, interbyte_delay_s * 1000)
+    ser.write(bytes([inv_kb2]))
+    result["sent_byte4"] = inv_kb2
+
+    # Give the ECU a brief moment before anything else touches the bus.
+    time.sleep(interbyte_delay_s)
+    ser.reset_input_buffer()
+
+    result["success"] = True
+    result["reason"] = "keyword_exchange_complete"
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Handshake -- confirmed protocol, with optional empirical prefix.
 #
 # Confirmed sequence (from eculib.honda.HondaECU.init/ping/diag and
@@ -306,21 +473,42 @@ def _break_pulse(ser: serial.Serial, low_ms: float, high_ms: float) -> None:
 # ---------------------------------------------------------------------------
 
 def two_phase_handshake(ser: serial.Serial, do_address_prestep: bool = True,
-                         skip_wake: bool = False) -> dict:
+                         skip_wake: bool = False, skip_diag: bool = False,
+                         no_break: bool = False) -> dict:
     """
-    skip_wake: the K45A has been observed to NOT respond to the FE 04 72 8C
-    wake packet at all (clean echo, then silence -- confirmed twice, once
-    under the old buggy collision-prone code and again under this fixed
-    version). Not all Keihin ECUs in this model range implement every
-    protocol step identically. When skip_wake=True, we go straight from
-    the address pre-step to diag(), which is the only thing that has ever
-    gotten a response out of this specific ECU so far.
+    no_break: eculib's own detect_ecu_state() tries a table read COLD --
+    before any break pulse at all -- and only calls init() (break pulse)
+    if that gets no response. We had never tested that order. When
+    no_break=True, do_address_prestep and skip_wake are both forced off
+    (there's no break, so there's nothing to prefix or replace), and the
+    handshake becomes a no-op that just confirms the connection is open --
+    real communication should be attempted directly via the `raw` command
+    or query_table() with no wake sequence at all.
     """
+    if no_break:
+        logger.debug("no_break=True: skipping ALL wake sequences (prestep, break, "
+                     "wake, diag) -- testing whether the ECU responds cold, "
+                     "matching eculib's detect_ecu_state() which tries "
+                     "communication before any break pulse")
+        return {
+            "mode": InitMode.TWO_PHASE.value,
+            "address_prestep_used": False,
+            "address_prestep_recv": None,
+            "skip_wake": True,
+            "skip_diag": True,
+            "no_break": True,
+            "ping_recv": None,
+            "diag_recv": None,
+            "success": True,
+            "reason": "no_break_cold_connection",
+        }
+
     result = {
         "mode": InitMode.TWO_PHASE.value,
         "address_prestep_used": do_address_prestep,
         "address_prestep_recv": None,
         "skip_wake": skip_wake,
+        "skip_diag": skip_diag,
         "ping_recv": None,
         "diag_recv": None,
         "success": False,
@@ -369,6 +557,13 @@ def two_phase_handshake(ser: serial.Serial, do_address_prestep: bool = True,
         if ping_resp is None:
             result["reason"] = "ping_no_response"
             return result
+
+    if skip_diag:
+        logger.debug("skip_diag=True -- treating pre-step/wake completion as sufficient "
+                     "for exploration; NOT requiring diag() to succeed")
+        result["success"] = True
+        result["reason"] = "handshake_partial_skip_diag"
+        return result
 
     diag_resp = send_and_receive(ser, [0x72], [0x00, 0xF0], label="diag")
     result["diag_recv"] = diag_resp
@@ -432,6 +627,96 @@ def read_vin(ser: serial.Serial) -> list | None:
 def read_live_data(ser: serial.Serial) -> list | None:
     """Confirmed live telemetry table."""
     return query_table(ser, LIVE_DATA_TABLE)
+
+
+# ---------------------------------------------------------------------------
+# Single-byte probe
+#
+# The corruption we see after the address pre-step doesn't change with
+# byte-pacing (2ms/5ms/10ms all gave identical results), which rules out
+# a millisecond-scale turnaround-timing issue. The corrupted echo also
+# showed an EXTRA byte (0xFF) inserted right after our first header byte,
+# shifting everything after it -- suggesting the ECU may be reacting to
+# just the header byte alone, before we've sent anything else. This probe
+# isolates that: send exactly one byte, then listen for a while and report
+# everything observed, with nothing else in flight to confuse the picture.
+# ---------------------------------------------------------------------------
+
+def single_byte_probe(ser: serial.Serial, byte_val: int, window_s: float = 3.0) -> list:
+    """
+    Returns a list of (byte_value, elapsed_ms_since_tx) tuples, so we can
+    see exactly when each byte arrived relative to transmission -- e.g.
+    whether an echo and a real ECU reaction arrive together in the same
+    instant (near-simultaneous bus event) or with a measurable gap
+    (a genuine, timed ECU response).
+    """
+    ser.reset_input_buffer()
+    ser.reset_output_buffer()
+
+    _log_tx("single_byte", [byte_val])
+    tx_time = time.time()
+    ser.write(bytes([byte_val]))
+
+    captured = []
+    deadline = tx_time + window_s
+    while time.time() < deadline:
+        chunk = ser.read(1)
+        if chunk:
+            elapsed_ms = (time.time() - tx_time) * 1000.0
+            captured.append((chunk[0], elapsed_ms))
+
+    formatted = " ".join(f"{b:02X}@{t:.2f}ms" for b, t in captured) if captured else "(none)"
+    logger.debug("RX [single_byte_response]: %s", formatted)
+    return captured
+
+
+# ---------------------------------------------------------------------------
+# VIN byte-by-byte probe
+#
+# single_byte_probe() showed the ECU replies with 0xFF roughly one
+# byte-time after receiving just our header byte 0x72 alone -- suggesting
+# it may treat a single byte as a complete short command rather than "the
+# first byte of a longer message coming next." This sends the VIN request
+# (72 05 71 00 18) ONE BYTE AT A TIME, listening after each individual
+# byte, so we can see exactly what the ECU does at every step instead of
+# guessing at the right framing. Every byte is sent regardless of what
+# came back for the previous one -- this is a diagnostic tool, not yet a
+# "smart" adaptive sender, since we don't know the real framing rules yet.
+# ---------------------------------------------------------------------------
+
+VIN_REQUEST_BYTES = [0x72, 0x05, 0x71, 0x00, 0x18]  # confirmed VIN request, byte by byte
+
+
+def vin_probe_byte_by_byte(ser: serial.Serial, window_per_byte_s: float = 0.15) -> dict:
+    """
+    Sends each byte of the VIN request separately, listening for
+    window_per_byte_s after each one. Returns {byte_index: [(byte, elapsed_ms), ...]}
+    so you can see exactly when/what the ECU says after each byte we send.
+    """
+    ser.reset_input_buffer()
+    ser.reset_output_buffer()
+
+    results = {}
+
+    for i, b in enumerate(VIN_REQUEST_BYTES):
+        _log_tx(f"vin_byte_{i}", [b])
+        tx_time = time.time()
+        ser.write(bytes([b]))
+
+        captured = []
+        deadline = tx_time + window_per_byte_s
+        while time.time() < deadline:
+            chunk = ser.read(1)
+            if chunk:
+                elapsed_ms = (time.time() - tx_time) * 1000.0
+                captured.append((chunk[0], elapsed_ms))
+
+        formatted = " ".join(f"{cb:02X}@{ct:.2f}ms" for cb, ct in captured) if captured else "(none)"
+        logger.debug("After sending byte %d (0x%02X): %s", i, b, formatted)
+
+        results[i] = {"sent_byte": b, "captured": captured}
+
+    return results
 
 
 def probe_known_tables(ser: serial.Serial) -> dict:

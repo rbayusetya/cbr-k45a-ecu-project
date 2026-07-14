@@ -95,7 +95,8 @@ def _print_handshake_result(result: dict) -> None:
 
 
 def _open_and_handshake(config: dict, port_override, init_mode: str,
-                         no_prestep: bool = False, skip_wake: bool = False):
+                         no_prestep: bool = False, skip_wake: bool = False,
+                         skip_diag: bool = False):
     conn = config.get("connection", {})
     port = port_override or conn.get("port", "COM3")
     baud = conn.get("baudrate", 10400)
@@ -109,6 +110,7 @@ def _open_and_handshake(config: dict, port_override, init_mode: str,
     if InitMode(init_mode) == InitMode.TWO_PHASE:
         kwargs["do_address_prestep"] = not no_prestep
         kwargs["skip_wake"] = skip_wake
+        kwargs["skip_diag"] = skip_diag
 
     result = perform_handshake(ser, mode=InitMode(init_mode), **kwargs)
     _print_handshake_result(result)
@@ -352,6 +354,144 @@ def run_sniff(config: dict, port_override, duration: float) -> None:
 # CLI
 # ---------------------------------------------------------------------------
 
+def run_raw(config: dict, port_override, init_mode: str,
+            mtype_str: str, data_str: str, no_prestep: bool, skip_wake: bool,
+            skip_diag: bool, no_break: bool = False, pace_ms: float = 0.0) -> None:
+    from .ecu_interface import send_and_receive
+
+    mtype = [int(mtype_str, 0)]
+    data = [int(x, 0) for x in data_str.split(",")] if data_str.strip() else []
+
+    conn = config.get("connection", {})
+    port = port_override or conn.get("port", "COM3")
+    baud = conn.get("baudrate", 10400)
+    timeout = conn.get("timeout", 1.0)
+
+    if no_break:
+        print(f"Connecting to {port} at {baud} baud (no wake sequence -- cold)...")
+        ser = open_connection(port, baud, timeout)
+    else:
+        ser = _open_and_handshake(config, port_override, init_mode, no_prestep, skip_wake, skip_diag)
+    if not ser:
+        sys.exit(1)
+
+    print(f"Sending mtype={_fmt(mtype)} data={_fmt(data)}...")
+    resp = send_and_receive(ser, mtype, data, timeout=3.0, label="raw", inter_byte_delay_ms=pace_ms)
+    ser.close()
+
+    if resp is None:
+        print("No response / invalid / timeout")
+    else:
+        print(f"Response data: {_fmt(resp)}")
+
+
+def run_probe_byte(config: dict, port_override, init_mode: str, byte_val_str: str,
+                    window: float, no_prestep: bool, skip_wake: bool,
+                    skip_diag: bool, no_break: bool = False) -> None:
+    from .ecu_interface import single_byte_probe
+
+    byte_val = int(byte_val_str, 0)
+    conn = config.get("connection", {})
+    port = port_override or conn.get("port", "COM3")
+    baud = conn.get("baudrate", 10400)
+    timeout = conn.get("timeout", 1.0)
+
+    if no_break:
+        print(f"Connecting to {port} at {baud} baud (no wake sequence -- cold)...")
+        ser = open_connection(port, baud, timeout)
+    else:
+        ser = _open_and_handshake(config, port_override, init_mode, no_prestep, skip_wake, skip_diag)
+        if not ser:
+            sys.exit(1)
+
+    print(f"Sending single byte 0x{byte_val:02X}, listening for {window}s...")
+    captured = single_byte_probe(ser, byte_val, window_s=window)
+    ser.close()
+
+    print(f"Captured {len(captured)} byte(s):")
+    for b, elapsed_ms in captured:
+        print(f"  0x{b:02X}  @ {elapsed_ms:7.2f} ms after TX")
+
+
+def run_vin_probe(config: dict, port_override, init_mode: str, window_per_byte: float,
+                   no_prestep: bool, skip_wake: bool, skip_diag: bool,
+                   no_break: bool = False) -> None:
+    from .ecu_interface import VIN_REQUEST_BYTES, vin_probe_byte_by_byte
+
+    conn = config.get("connection", {})
+    port = port_override or conn.get("port", "COM3")
+    baud = conn.get("baudrate", 10400)
+    timeout = conn.get("timeout", 1.0)
+
+    if no_break:
+        print(f"Connecting to {port} at {baud} baud (no wake sequence -- cold)...")
+        ser = open_connection(port, baud, timeout)
+    else:
+        ser = _open_and_handshake(config, port_override, init_mode, no_prestep, skip_wake, skip_diag)
+        if not ser:
+            sys.exit(1)
+
+    print(f"Sending VIN request {_fmt(VIN_REQUEST_BYTES)} one byte at a time...")
+    print(f"Listening {window_per_byte}s after each byte")
+    print("-" * 50)
+
+    results = vin_probe_byte_by_byte(ser, window_per_byte_s=window_per_byte)
+    ser.close()
+
+    for i, info in results.items():
+        sent = info["sent_byte"]
+        captured = info["captured"]
+        print(f"\nAfter sending byte {i} (0x{sent:02X}):")
+        if not captured:
+            print("  (nothing received)")
+        else:
+            for b, elapsed_ms in captured:
+                print(f"  0x{b:02X}  @ {elapsed_ms:7.2f} ms")
+
+
+def run_iso5baud(config: dict, port_override, address_str: str,
+                  keyword_wait: float, interbyte_delay: float,
+                  then_read_vin: bool) -> None:
+    from .ecu_interface import iso_5baud_handshake, read_vin
+
+    conn = config.get("connection", {})
+    port = port_override or conn.get("port", "COM3")
+    baud = conn.get("baudrate", 10400)
+    timeout = conn.get("timeout", 1.0)
+    address = int(address_str, 0)
+
+    print(f"Connecting to {port} (starting baud will be bit-banged, then switched to {baud})...")
+    ser = open_connection(port, baud, timeout)
+
+    print(f"Running ISO9141-2 5-baud init (address=0x{address:02X})...")
+    print("This takes about 2 seconds for the bit-banged address byte alone.")
+    result = iso_5baud_handshake(ser, port, baud, timeout, address=address,
+                                 keyword_wait_s=keyword_wait,
+                                 interbyte_delay_s=interbyte_delay)
+
+    print(f"\nResult: {'SUCCESS' if result['success'] else 'FAILED'} -- {result['reason']}")
+    kb_bytes = result.get("keyword_bytes_captured", [])
+    if kb_bytes:
+        print("Keyword bytes captured:")
+        for b, t in kb_bytes:
+            print(f"  0x{b:02X}  @ {t:7.2f} ms")
+    if result.get("kb1") is not None:
+        print(f"KB1=0x{result['kb1']:02X}  KB2=0x{result['kb2']:02X}  "
+              f"~KB1=0x{result['inv_kb1']:02X}  ~KB2=0x{result['inv_kb2']:02X}")
+    if result["sent_byte3"] is not None:
+        print(f"Sent byte3=0x{result['sent_byte3']:02X}, byte4=0x{result['sent_byte4']:02X}")
+
+    if result["success"] and then_read_vin:
+        print("\nHandshake phase complete -- attempting VIN read...")
+        resp = read_vin(ser)
+        if resp is None:
+            print("VIN: no response")
+        else:
+            print(f"VIN raw bytes: {_fmt(resp)}")
+
+    ser.close()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Honda Keihin K-Line ECU Reader & Prober"
@@ -419,6 +559,49 @@ def main() -> None:
     p_sniff = sub.add_parser("sniff", help="Passive listen, no init sent")
     p_sniff.add_argument("--duration", type=float, default=10.0)
 
+    p_pb = sub.add_parser("probe-byte", help="Send exactly one raw byte, then listen and report everything")
+    p_pb.add_argument("byte_val", help="Hex byte to send, e.g. 0x72")
+    p_pb.add_argument("--window", type=float, default=3.0, help="Seconds to listen after sending")
+    p_pb.add_argument("--init-mode", choices=[m.value for m in InitMode if m != InitMode.PASSIVE_SNIFF],
+                      default=InitMode.TWO_PHASE.value)
+    p_pb.add_argument("--no-prestep", action="store_true")
+    p_pb.add_argument("--skip-wake", action="store_true")
+    p_pb.add_argument("--skip-diag", action="store_true")
+    p_pb.add_argument("--no-break", action="store_true")
+
+    p_vp = sub.add_parser("vin-probe", help="Send the VIN request one byte at a time, listening after each")
+    p_vp.add_argument("--window-per-byte", type=float, default=0.15,
+                      help="Seconds to listen after each individual byte sent")
+    p_vp.add_argument("--init-mode", choices=[m.value for m in InitMode if m != InitMode.PASSIVE_SNIFF],
+                      default=InitMode.TWO_PHASE.value)
+    p_vp.add_argument("--no-prestep", action="store_true")
+    p_vp.add_argument("--skip-wake", action="store_true")
+    p_vp.add_argument("--skip-diag", action="store_true")
+    p_vp.add_argument("--no-break", action="store_true")
+
+    p_iso = sub.add_parser("iso5baud", help="Try the proper ISO9141-2 5-baud init (4-phase, address 0x33)")
+    p_iso.add_argument("--address", default="0x33", help="Address byte to bit-bang (default 0x33)")
+    p_iso.add_argument("--keyword-wait", type=float, default=0.05,
+                       help="Seconds to listen for keyword bytes after baud switch (default 0.05 = 50ms)")
+    p_iso.add_argument("--interbyte-delay", type=float, default=0.005,
+                       help="Seconds between sending byte3 and byte4 (default 0.005 = 5ms)")
+    p_iso.add_argument("--then-read-vin", action="store_true",
+                       help="If the handshake completes, immediately try reading VIN afterward")
+
+    p_raw = sub.add_parser("raw", help="Send an arbitrary mtype/data command for exploration")
+    p_raw.add_argument("mtype", help="Hex byte for mtype, e.g. 0x72")
+    p_raw.add_argument("data", help="Comma-separated hex bytes for data, e.g. 0x0f,0xf0")
+    p_raw.add_argument("--init-mode", choices=[m.value for m in InitMode if m != InitMode.PASSIVE_SNIFF],
+                       default=InitMode.TWO_PHASE.value)
+    p_raw.add_argument("--no-prestep", action="store_true")
+    p_raw.add_argument("--skip-wake", action="store_true")
+    p_raw.add_argument("--skip-diag", action="store_true",
+                       help="Do not require diag() to succeed -- just prestep/wake then send the raw command")
+    p_raw.add_argument("--no-break", action="store_true",
+                       help="Skip ALL wake sequences entirely -- try communicating cold")
+    p_raw.add_argument("--pace-ms", type=float, default=0.0,
+                       help="Inter-byte delay in ms when transmitting (test ECU turnaround timing)")
+
     parser.add_argument("--port", help="Serial port (e.g. /dev/ttyUSB0)")
     parser.add_argument("--config", default=str(Path(__file__).parent / "config.yaml"))
     parser.add_argument("--debug", action="store_true",
@@ -452,6 +635,18 @@ def main() -> None:
         run_clear_faults(config, args.port, args.init_mode, args.no_prestep, args.yes, args.skip_wake)
     elif args.command == "sniff":
         run_sniff(config, args.port, args.duration)
+    elif args.command == "raw":
+        run_raw(config, args.port, args.init_mode, args.mtype, args.data,
+                args.no_prestep, args.skip_wake, args.skip_diag, args.no_break, args.pace_ms)
+    elif args.command == "probe-byte":
+        run_probe_byte(config, args.port, args.init_mode, args.byte_val, args.window,
+                       args.no_prestep, args.skip_wake, args.skip_diag, args.no_break)
+    elif args.command == "vin-probe":
+        run_vin_probe(config, args.port, args.init_mode, args.window_per_byte,
+                      args.no_prestep, args.skip_wake, args.skip_diag, args.no_break)
+    elif args.command == "iso5baud":
+        run_iso5baud(config, args.port, args.address, args.keyword_wait,
+                    args.interbyte_delay, args.then_read_vin)
     else:
         parser.print_help()
 
